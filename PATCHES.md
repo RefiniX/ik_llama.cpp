@@ -1,6 +1,6 @@
 # CPU performance patches for ik_llama.cpp
 
-A set of CPU-side patches on top of ik_llama.cpp `41d123e9`, written and benchmarked on a dual-socket Cascade Lake box. They are offered as-is: anyone may take, rewrite or submit any of them, under their own name, with no attribution needed. I will not be maintaining this branch or turning these into PRs myself.
+A set of CPU-side patches on top of ik_llama.cpp `41d123e9`, written and benchmarked on a dual-socket Cascade Lake box. My own patches are offered as-is: anyone may take, rewrite or submit them, under their own name, with no attribution needed. Two patches are other people's work, included under the project's MIT license; please credit their authors if you reuse them: NUMA weight/KV mirroring on `numa-mirror-41d123e9` (written by mikechambers84, rebased by sultanqasim; my port adds the KV resyncs) and the qwen35 pre-tokenizer split (Kabir Potdar, ggml-org/llama.cpp#22110). I will not be maintaining this branch or turning these into PRs myself.
 
 **AI disclosure:** the investigation, the patches and the benchmarks were done by an AI agent (Claude Code, Claude Opus) on my machine, under my direction. I have been running these builds in daily use; I have not independently re-derived the analysis. Please test on your own hardware before relying on any of it.
 
