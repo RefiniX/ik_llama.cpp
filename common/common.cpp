@@ -2618,6 +2618,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             /**/ if (item == "all")         { mask |= GGML_NUMA_MIRROR_ALL; }
             else if (item == "none")        { mask  = 0; }
             else if (item == "weights")     { mask |= GGML_NUMA_MIRROR_WEIGHTS; }
+            else if (item == "dense")       { mask |= GGML_NUMA_MIRROR_DENSE; }
             else if (item == "kv")          { mask |= GGML_NUMA_MIRROR_KV; }
             else { ok = false; }
         }
@@ -3695,7 +3696,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
     options.push_back({ "*",           "       --numa-mirror LIST",     "comma list selecting what to mirror with --numa mirror:\n"
-                                                                        "  weights, kv, all, none (default: all). implies --numa mirror" });
+                                                                        "  weights, dense, kv, all, none (default: all). implies --numa mirror\n"
+                                                                        "  dense: copy only weights read in full every token (attention, SSM, router, shared expert, output);\n"
+                                                                        "  routed experts and lookup tables stay single-copy (for models that do not fit twice)" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",
