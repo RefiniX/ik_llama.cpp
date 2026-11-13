@@ -18931,6 +18931,37 @@ static void ggml_compute_forward_group_norm(
 
 // ggml_compute_forward_mul_mat
 
+// Activation types whose quantized rows are plain rows (no interleaving), so from_float can produce one row on its own.
+static bool ggml_src1_plain_rows(enum ggml_type vec_dot_type, int64_t ne10) {
+    switch (vec_dot_type) {
+        case GGML_TYPE_Q8_2_X4: return ne10 % 32  == 0 && ne10 >= 2*128;
+        case GGML_TYPE_Q8_K:
+        case GGML_TYPE_Q8_K32:  return ne10 % QK_K == 0 && ne10 >= 2*QK_K;
+        default:                return false;
+    }
+}
+
+// Quantize src1 (F32) into wdata for a matrix multiplication. With fewer rows than threads, thread 0 quantizes all
+// of them: every thread of the following matmul reads the quantized rows, and rows written by other cores are read
+// from their modified cache lines, which costs more than the parallel quantization saves.
+// Returns false when this does not apply; the caller then splits by rows as before.
+static bool ggml_quantize_src1_few_rows(const struct ggml_tensor * src1, enum ggml_type vec_dot_type,
+        ggml_from_float_t from_float, char * wdata, size_t nbw1, size_t nbw2, size_t nbw3, int ith, int nth) {
+    if (src1->type != GGML_TYPE_F32 || !from_float) return false;
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
+    const int64_t nr1  = ne11*ne12*ne13;
+    if (nr1 >= nth || !ggml_src1_plain_rows(vec_dot_type, ne10)) return false;
+    if (ith != 0) return true;
+    for (int64_t ir1 = 0; ir1 < nr1; ++ir1) {
+        const int64_t i13 = ir1/(ne11*ne12);
+        const int64_t i12 = (ir1 - i13*ne11*ne12)/ne11;
+        const int64_t i11 = ir1 - i13*ne11*ne12 - i12*ne11;
+        from_float((const float *)((const char *) src1->data + i13*src1->nb[3] + i12*src1->nb[2] + i11*src1->nb[1]),
+                   (void *)(wdata + i13*nbw3 + i12*nbw2 + i11*nbw1), ne10);
+    }
+    return true;
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -19098,8 +19129,9 @@ static int ggml_compute_forward_mul_mat(
 
         assert(params->wsize >= ne13*nbw3);
         bool done = false;
+        done = ggml_quantize_src1_few_rows(src1, vec_dot_type, from_float, wdata, nbw1, nbw2, nbw3, ith, nth);
 #if GGML_USE_IQK_MULMAT
-        if (true) {
+        if (!done) {
             done = true;
             char * work_buffer = wdata;// + ne13*nbw3 + ith*ne10*sizeof(float);
             if (src1->type != GGML_TYPE_F32) {
@@ -19341,6 +19373,7 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t ir10 = dr1*ith;
         const int64_t ir11 = MIN(ir10 + dr1, nr1);
 
+        if (!ggml_quantize_src1_few_rows(src1, vec_dot_type, from_float, wdata, nbw1, nbw2, nbw3, ith, nth))
         for (int64_t ir1 = ir10; ir1 < ir11; ++ir1) {
             const int64_t i13 = ir1/(ne11*ne12);
             const int64_t i12 = (ir1 - i13*ne11*ne12)/ne11;
@@ -19674,6 +19707,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         const int64_t ir10 = dr1*ith;
         const int64_t ir11 = MIN(ir10 + dr1, nr1);
 
+        if (!ggml_quantize_src1_few_rows(src1, vec_dot_type, from_float, wdata, nbw1, nbw2, nbw3, ith, nth))
         for (int64_t ir1 = ir10; ir1 < ir11; ++ir1) {
             const int64_t i13 = ir1/(ne11*ne12);
             const int64_t i12 = (ir1 - i13*ne11*ne12)/ne11;
@@ -19888,6 +19922,7 @@ static void ggml_compute_forward_mul_mat_up_gate(
     const int64_t ir10 = dr1*ith;
     const int64_t ir11 = MIN(ir10 + dr1, nr1);
 
+    if (!ggml_quantize_src1_few_rows(src1, vec_dot_type, from_float, wdata, nbw1, nbw2, nbw3, ith, nth))
     for (int64_t ir1 = ir10; ir1 < ir11; ++ir1) {
         const int64_t i13 = ir1/(ne11*ne12);
         const int64_t i12 = (ir1 - i13*ne11*ne12)/ne11;
