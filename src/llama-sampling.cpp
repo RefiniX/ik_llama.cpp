@@ -103,6 +103,40 @@ static void llama_sort(llama_token_data_array * candidates, int32_t k) {
     candidates->sorted = true;
 }
 
+// The final draw does not need sorted candidates: if unsorted, softmax in place and move the top token to data[0].
+void llama_sample_dist_impl(struct llama_sampling * smpl, llama_token_data_array * candidates) {
+    GGML_ASSERT(candidates->size > 0);
+    if (candidates->sorted) {
+        llama_sample_softmax_impl(smpl, candidates, /* normalize */ true);
+        return;
+    }
+
+    const int64_t t_start_sample_us = ggml_time_us();
+
+    size_t imax  = 0;
+    float  max_l = candidates->data[0].logit;
+    for (size_t i = 1; i < candidates->size; ++i) {
+        if (candidates->data[i].logit > max_l) {
+            max_l = candidates->data[i].logit;
+            imax  = i;
+        }
+    }
+    float cum_sum = 0.0f;
+    for (size_t i = 0; i < candidates->size; ++i) {
+        float p = expf(candidates->data[i].logit - max_l);
+        candidates->data[i].p = p;
+        cum_sum += p;
+    }
+    for (size_t i = 0; i < candidates->size; ++i) {
+        candidates->data[i].p /= cum_sum;
+    }
+    std::swap(candidates->data[0], candidates->data[imax]);
+
+    if (smpl) {
+        smpl->t_sample_us += ggml_time_us() - t_start_sample_us;
+    }
+}
+
 void llama_sample_softmax_impl(struct llama_sampling * smpl, llama_token_data_array * candidates, bool normalize) {
     GGML_ASSERT(candidates->size > 0);
 
@@ -134,8 +168,9 @@ void llama_sample_top_k_impl(struct llama_sampling * smpl, llama_token_data_arra
 
     const int64_t t_start_sample_us = ggml_time_us();
 
+    // k <= 0: disabled (as in mainline)
     if (k <= 0) {
-        k = candidates->size;
+        return;
     }
 
     k = std::max(k, (int) min_keep);

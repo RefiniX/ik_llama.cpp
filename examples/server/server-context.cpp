@@ -2401,7 +2401,8 @@ void server_context::populate_token_probs(const server_slot& slot, completion_to
     size_t n_vocab = llama_n_vocab(llama_get_model(ctx));
 
     if (post_sampling) {
-        const auto* cur_p = common_sampler_get_candidates(slot.ctx_sampling);
+        // sort by probability
+        const auto* cur_p = common_sampler_get_candidates(slot.ctx_sampling, true);
         const size_t max_probs = cur_p->size;
 
         // set probability for sampled token
