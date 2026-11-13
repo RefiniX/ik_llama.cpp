@@ -2543,13 +2543,62 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
     return true;
 }
 
+struct recurrent_host_copy {
+    char       * dst;
+    const char * src;
+    size_t       nbytes;
+};
+
+// The CPU backend has no async copy: run host-to-host copies as CPY nodes so they use the compute threads.
+static void recurrent_host_copy_parallel(const std::vector<recurrent_host_copy> & copies, int n_threads) {
+    if (copies.empty()) {
+        return;
+    }
+    size_t n_bytes = 0;
+    for (const auto & c : copies) n_bytes += c.nbytes;
+    if (n_threads <= 1 || n_bytes < 1024*1024) {
+        for (const auto & c : copies) std::memcpy(c.dst, c.src, c.nbytes);
+        return;
+    }
+    const size_t n_nodes = copies.size();
+    const size_t mem_size = (3*n_nodes + 8)*ggml_tensor_overhead() + ggml_graph_overhead_custom(3*n_nodes, false)
+                          + (size_t) n_threads*256 + 4096;
+    std::vector<uint8_t> mem(mem_size);
+    ggml_init_params params = { mem_size, mem.data(), /*no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(params);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 3*n_nodes, false);
+    for (const auto & c : copies) {
+        ggml_tensor * src = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) c.nbytes);
+        ggml_tensor * dst = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) c.nbytes);
+        src->data = (void *) c.src;
+        dst->data = c.dst;
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+    }
+    ggml_graph_compute_with_ctx(ctx, gf, n_threads);
+    ggml_free(ctx);
+}
+
 static void restore_recurrent_cache_tensors(int step, uint32_t slot, ggml_backend_sched_t sched,
         size_t ssm_bytes, size_t conv_bytes,
         ggml_tensor * s_l, ggml_tensor * per_step_ssm, ggml_tensor * per_step_conv,
-        std::unordered_set<ggml_backend_t> & backends_to_sync) {
+        std::unordered_set<ggml_backend_t> & backends_to_sync,
+        std::vector<recurrent_host_copy> & host_copies) {
     auto dst_backend = ggml_backend_sched_get_tensor_backend(sched, s_l);
     auto dst = *s_l;
     const size_t slot_off = slot * dst.nb[1];
+
+    if (ggml_backend_buffer_is_host(s_l->buffer) && ggml_backend_buffer_is_host(per_step_ssm->buffer) &&
+        ggml_backend_buffer_is_host(per_step_conv->buffer)) {
+        if (dst_backend) {
+            ggml_backend_synchronize(dst_backend);
+        }
+        host_copies.push_back({ (char *)s_l->data + slot_off + conv_bytes,
+                                (const char *)per_step_ssm->data + (size_t)step * ssm_bytes, ssm_bytes });
+        host_copies.push_back({ (char *)s_l->data + slot_off,
+                                (const char *)per_step_conv->data + (size_t)step * conv_bytes, conv_bytes });
+        return;
+    }
+
     dst.ne[0] = ssm_bytes/sizeof(float);
     dst.ne[1] = dst.ne[2] = dst.ne[3] = 1;
     dst.nb[1] = dst.nb[2] = dst.nb[3] = ssm_bytes + conv_bytes;
@@ -2566,7 +2615,7 @@ static void restore_recurrent_cache_tensors(int step, uint32_t slot, ggml_backen
     ggml_backend_tensor_copy_async(dst_backend, dst_backend, &src, &dst);
 }
 
-bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data ckpt_type, int step, uint32_t slot) {
+bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data ckpt_type, int step, uint32_t slot, int n_threads) {
     auto & ckpt = llama_get_ckpt(ckpt_type);
     if (ckpt.per_step_ssm.empty() || ckpt.per_step_max_allocated <= 1 ||
             step < 0 || step >= ckpt.per_step_max_allocated - 1) {
@@ -2574,6 +2623,7 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
     }
 
     std::unordered_set<ggml_backend_t> backends_to_sync;
+    std::vector<recurrent_host_copy> host_copies;
     const uint32_t n_layer = (uint32_t) s_l.size();
 
     for (uint32_t il = 0; il < n_layer; ++il) {
@@ -2623,7 +2673,7 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
                 (size_t) ckpt.per_step_max_allocated * sizeof(float);
             restore_recurrent_cache_tensors(step, slot, sched, ssm_bytes, conv_bytes,
                 s_l[il], per_step_ssm.front(), per_step_conv.front(),
-                backends_to_sync);
+                backends_to_sync, host_copies);
         } else {
             auto split_sl = (const ggml_split_tensor_t *) s_l[il]->extra;
             for (int id = 0; id < split_sl->n_device; ++id) {
@@ -2637,10 +2687,12 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
                     (size_t) ckpt.per_step_max_allocated * sizeof(float);
                 restore_recurrent_cache_tensors(step, slot, sched, ssm_bytes, conv_bytes,
                     split_sl->splits[id], (ggml_tensor *) per_step_ssm_tensor,
-                    (ggml_tensor *) per_step_conv_tensor, backends_to_sync);
+                    (ggml_tensor *) per_step_conv_tensor, backends_to_sync, host_copies);
             }
         }
     }
+
+    recurrent_host_copy_parallel(host_copies, n_threads);
 
     // TODO: do we need to synchronize here?
     for (auto backend : backends_to_sync) {
@@ -11373,7 +11425,7 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
                 return llama_dsv4_spec_ckpt_restore(ctx, ckpt_type, true, accepted_step);
             }
-            if (seq_id < 0 || !kv.per_step_restore(ctx->sched, ckpt_type, accepted_step, (uint32_t) seq_id)) {
+            if (seq_id < 0 || !kv.per_step_restore(ctx->sched, ckpt_type, accepted_step, (uint32_t) seq_id, (int) ctx->cparams.n_threads)) {
                 return LLAMA_SPEC_CKPT_RESTORE_FAILED;
             }
             const llama_pos accepted_pos = n_past + accepted_step;
