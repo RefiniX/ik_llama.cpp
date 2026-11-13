@@ -27,6 +27,33 @@ inline uint32_t simple_gcd(uint32_t a, uint32_t b) {
     }
     return a;
 }
+
+// Small batches with GQA: split the KV sequence across threads like the single-token path.
+constexpr int kFaSmallBatchMax      = 16;   // largest neq1 that takes this path
+constexpr int kFaSmallBatchNk       = 256;  // KV rows per work unit, so a K/V chunk stays in L2 across the rows
+constexpr int kFaSmallBatchMaxUnits = 16;   // work units per thread at most (bounds the partial-result buffer)
+// From neq1 = 8 the generic path (K repack) is faster unless the KV sequence is long.
+constexpr int kFaSmallBatchKvPerRow = 1024;
+inline bool fa_small_batch_applies(int neq1, int neq2, int neq3, int nek2, int nev2, int nek1, int nth, bool has_mask) {
+    if (neq1 < 2 || neq1 > kFaSmallBatchMax || neq3 != 1 || !has_mask) return false;
+    if (neq1 >= 8 && nek1 < kFaSmallBatchKvPerRow*neq1) return false;
+    if (nek2 < 1 || neq2 % nek2 != 0 || nev2 != nek2) return false;
+    return neq2/nek2 > 1 && nek1 % 32 == 0 && nek2*nek1 >= 32*nth;
+}
+inline int fa_small_batch_nk(int nek1, int nek2, int nth) {
+    // ~4 units per thread, at most kFaSmallBatchNk rows per unit unless that exceeds kFaSmallBatchMaxUnits*nth units
+    int nk = std::min(32*std::max(1, nek2*nek1/(32*4*nth)), kFaSmallBatchNk);
+    int max_units = kFaSmallBatchMaxUnits*nth;
+    if (nek2*((nek1 + nk - 1)/nk) > max_units) {
+        int64_t rows = (int64_t(nek2)*nek1 + max_units - 1)/max_units;
+        nk = 32*int((rows + 31)/32);
+    }
+    return nk;
+}
+// upper bound on the number of units for any nek1
+inline int fa_small_batch_max_units(int nek2, int nth) {
+    return std::max(8, kFaSmallBatchMaxUnits)*nth + nek2;
+}
 inline void accumulate_qkv(int Dv, float& M, float& S, float Mj, float Sj, float * Racc, const float * R) {
     if (Mj == -INFINITY) return;
     if (Mj > M) {
@@ -180,6 +207,11 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     size_t size = 0;
     if (Q->ne[1] >= 8 && K->type == GGML_TYPE_Q8_0) {
         size = ggml_row_size(GGML_TYPE_Q8_0, K->ne[0]) * K->ne[1]*K->ne[2]*K->ne[3];
+    }
+    if (fa_small_batch_applies(Q->ne[1], Q->ne[2], Q->ne[3], K->ne[2], V->ne[2], K->ne[1], nth, dst->src[3] != nullptr)) {
+        // keep the repack size too: a nek1 narrowed at run time (SWA) can fall back to the other paths
+        size_t result_size = (V->ne[0] + 16)*rk2*sizeof(float);
+        return std::max(size, size_t(fa_small_batch_max_units(K->ne[2], nth))*Q->ne[1]*result_size);
     }
     if (Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[2]/K->ne[2] > 1 && nth >= 1 && K->ne[1]/32 > 1) {
         if (K->ne[2] > 1) {
@@ -470,6 +502,61 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
             mask = (const void *)((const uint16_t *)mask + first_k);
             nek1 = last_k - first_k;
         }
+    }
+
+    if (rk2 == rv2 && fa_small_batch_applies(neq1, neq2, neq3, nek2, nev2, nek1, nth, mask != nullptr)) {
+        // unit = (KV head, chunk of nk KV rows), processed for all rk2 q heads and all query rows
+        const int nk    = fa_small_batch_nk(nek1, nek2, nth);
+        const int nkk   = (nek1 + nk - 1)/nk;
+        const int nunit = nek2*nkk;
+        const size_t result_size = (Dv + 16)*rk2*sizeof(float);
+        auto result = [&](int iu, int iq1) {
+            return (float *)((char *)work_buffer_in + (size_t(iu)*neq1 + iq1)*result_size);
+        };
+        for (int iu = ith; iu < nunit; iu += nth) {
+            const int ik02 = iu/nkk;
+            const int ik01 = nk*(iu - ik02*nkk);
+            const int this_nk = std::min(nk, nek1 - ik01);
+            auto this_k = (const char *)k + ik01*stride_k + ik02*nbk2;
+            auto this_v = (const char *)v + ik01*stride_v + ik02*nbv2;
+            for (int iq1 = 0; iq1 < neq1; ++iq1) {
+                auto R = result(iu, iq1);
+                auto this_q = (const float *)((const char *)q + iq1*stride_q + ik02*rk2*nbq2);
+                auto this_m = (const char *)mask + iq1*stride_m + ik01*sizeof(uint16_t); // fp16 mask
+                if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
+                         Dk, Dv, rk2, this_nk, nbq2, stride_k, stride_v, 0, Dv,
+                         this_q, (const void *)this_k, (const void *)this_v, (const void *)this_m, nullptr, 0,
+                         scale, softcap, R, R + Dv*rk2, R + (Dv+1)*rk2)) return false;
+            }
+        }
+
+        barrier(barrier_data);
+
+        for (int ir = ith; ir < neq1*neq2; ir += nth) {
+            const int iq1  = ir/neq2;
+            const int iq2  = ir - iq1*neq2;
+            const int ik02 = iq2/rk2;
+            const int il   = iq2 - ik02*rk2;
+            auto Racc = qkv + (size_t(iq1)*ne1 + iq2)*nb1/sizeof(float);
+            float M = -INFINITY, S = 0;
+            for (int ikk = 0; ikk < nkk; ++ikk) {
+                const float * R = result(ik02*nkk + ikk, iq1);
+                accumulate_qkv(Dv, M, S, R[Dv*rk2 + il], R[(Dv+1)*rk2 + il], Racc, R + il*Dv);
+            }
+            if (sinks) {
+                float s = ((const float *)sinks)[iq2];
+                if (s > M) {
+                    float m = expf(M - s);
+                    for (int i = 0; i < Dv; ++i) Racc[i] *= m;
+                    S = S*m + 1;
+                } else {
+                    S += expf(s - M);
+                }
+            }
+            float norm = S > 0 ? 1/S : 1;
+            for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+        }
+        return true;
     }
 
     int int_type_k = int_type_k_in;
