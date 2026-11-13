@@ -1,4 +1,4 @@
-> **This fork branch** carries CPU performance patches on top of ik_llama.cpp `41d123e9` (`numa-mirror-41d123e9` also adds NUMA mirroring). See [PATCHES.md](PATCHES.md) for what each patch does, measurements and known issues. Prepared with AI assistance (Claude Code); free to take, no attribution needed.
+> **This fork branch** carries CPU performance patches on top of ik_llama.cpp `41d123e9` (`numa-mirror-41d123e9` also adds NUMA mirroring). See [PATCHES.md](PATCHES.md) for what each patch does, measurements and known issues. Prepared with AI assistance (Claude Code). My own patches are free to take with no attribution; two are other people's work under MIT, credited in PATCHES.md.
 
 # ik_llama.cpp: llama.cpp fork with better CPU performance
 
