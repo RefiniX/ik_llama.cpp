@@ -106,6 +106,11 @@ struct llama_kv_cache {
     uint32_t size = 0;
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
+    // cells at index >= cell_hwm are empty (pos == -1, no seq_id)
+    uint32_t cell_hwm = 0;
+    uint32_t scan_end() const { return recurrent ? size : (cell_hwm < size ? cell_hwm : size); }
+    void note_cell(uint32_t i) { if (i >= cell_hwm) cell_hwm = i + 1; }
+
     std::vector<uint32_t> row_count;
 
     bool any_compacted() const { return !row_count.empty(); }

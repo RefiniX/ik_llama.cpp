@@ -1329,6 +1329,7 @@ static bool llama_kv_cache_init(
 
     cache.cells.clear();
     cache.cells.resize(kv_size);
+    cache.cell_hwm = 0;
 
     if (cache.recurrent || llm_arch_is_hybrid(model.arch)) {
         // init state copy sources
@@ -1864,6 +1865,7 @@ static bool llama_kv_cache_find_slot(
                         cache.used += 1;
                     }
                     cache.cells[seq_id].pos = batch.pos[i];
+                    cache.note_cell(seq_id);
                     // NOTE: seq_ids are not inserted here; they are handled when the input tensors are set
                 } else {
                     // too big seq_id
@@ -1929,6 +1931,9 @@ static bool llama_kv_cache_find_slot(
         for (int32_t j = 0; j < batch.n_seq_id[i]; j++) {
             cache.cells[cache.head + i].seq_id.insert(batch.seq_id[i][j]);
         }
+    }
+    if (n_tokens > 0) {
+        cache.note_cell(cache.head + n_tokens - 1);
     }
 
     cache.used += n_tokens;
@@ -2083,7 +2088,7 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
 
 // find how many cells are currently in use
 static uint32_t llama_kv_cache_cell_max(const struct llama_kv_cache & cache) {
-    for (uint32_t i = cache.size; i > 0; --i) {
+    for (uint32_t i = cache.scan_end(); i > 0; --i) {
         const llama_kv_cell & cell = cache.cells[i - 1];
 
         if (cell.pos >= 0 && !cell.is_empty()) {
@@ -2754,6 +2759,7 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     }
     cache.head = 0;
     cache.used = 0;
+    cache.cell_hwm = 0;
     cache.cells_disordered = false;
     cache.head_swa     = cache.sink_rows;
     cache.pos_base_swa = 0;
@@ -2827,7 +2833,8 @@ static bool llama_kv_cache_seq_rm(
 
     const bool has_qnext_state = llama_kv_has_qnext_state_storage(cache);
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    const uint32_t n_scan = cache.scan_end();
+    for (uint32_t i = 0; i < n_scan; ++i) {
         if (cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
             if (seq_id < 0) {
                 cache.cells[i].seq_id.clear();
@@ -2851,6 +2858,13 @@ static bool llama_kv_cache_seq_rm(
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cache.size && new_head < cache.head) cache.head = new_head;
+
+    // drop the bound past the trailing cells that are now empty
+    if (!cache.recurrent) {
+        while (cache.cell_hwm > 0 && cache.cells[cache.cell_hwm - 1].pos < 0 && cache.cells[cache.cell_hwm - 1].is_empty()) {
+            --cache.cell_hwm;
+        }
+    }
 
     if (compact_apply) {
         cache.head_swa     = compact_head;
@@ -2888,6 +2902,7 @@ static void llama_kv_cache_seq_cp(
 
             cache.cells[seq_id_dst].pos = cache.cells[seq_id_src].pos;
             cache.cells[seq_id_dst].tok = cache.cells[seq_id_src].tok;
+            cache.note_cell(seq_id_dst);
         }
         return;
     }
@@ -2904,6 +2919,7 @@ static void llama_kv_cache_seq_cp(
         cache.cells[seq_id_dst].src = seq_id_src;
         cache.cells[seq_id_dst].pos = cache.cells[seq_id_src].pos;
         cache.cells[seq_id_dst].tok = cache.cells[seq_id_src].tok;
+        cache.note_cell(seq_id_dst);
         cache.do_copy = true;
     }
 
@@ -2911,7 +2927,8 @@ static void llama_kv_cache_seq_cp(
 
     cache.head = 0;
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    const uint32_t n_scan = cache.scan_end();
+    for (uint32_t i = 0; i < n_scan; ++i) {
         if (cache.cells[i].has_seq_id(seq_id_src) && cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
             cache.cells[i].seq_id.insert(seq_id_dst);
         }
@@ -2978,7 +2995,8 @@ static void llama_kv_cache_seq_add(
         return;
     }
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    const uint32_t n_scan = cache.scan_end();
+    for (uint32_t i = 0; i < n_scan; ++i) {
         if (cache.cells[i].has_seq_id(seq_id) && cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
             cache.has_shift = true;
             cache.cells_disordered = true;
@@ -3029,7 +3047,8 @@ static void llama_kv_cache_seq_div(
         return;
     }
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    const uint32_t n_scan = cache.scan_end();
+    for (uint32_t i = 0; i < n_scan; ++i) {
         if (cache.cells[i].has_seq_id(seq_id) && cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
             cache.has_shift = true;
 
@@ -3045,7 +3064,8 @@ static void llama_kv_cache_seq_div(
 static llama_pos llama_kv_cache_seq_pos_max(const struct llama_kv_cache & cache, llama_seq_id seq_id) {
     llama_pos result = 0;
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    const uint32_t n_scan = cache.scan_end();
+    for (uint32_t i = 0; i < n_scan; ++i) {
         if (cache.cells[i].has_seq_id(seq_id)) {
             result = std::max(result, cache.cells[i].pos);
         }
@@ -3057,7 +3077,8 @@ static llama_pos llama_kv_cache_seq_pos_max(const struct llama_kv_cache & cache,
 static llama_pos llama_kv_cache_seq_pos_min(const struct llama_kv_cache & cache, llama_seq_id seq_id) {
     llama_pos result = -1;
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    const uint32_t n_scan = cache.scan_end();
+    for (uint32_t i = 0; i < n_scan; ++i) {
         if (cache.cells[i].has_seq_id(seq_id)) {
             result = cache.cells[i].pos;
             break;
@@ -11594,6 +11615,7 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
             // cell is an attention cell of some other position
             if (kv.recurrent && seq_id >= 0 && (uint32_t)seq_id < kv.size) {
                 kv.cells[seq_id].pos = accepted_pos;
+                kv.note_cell((uint32_t) seq_id);
             }
             llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
             return LLAMA_SPEC_CKPT_RESTORE_DIRECT;
@@ -12650,6 +12672,7 @@ struct llama_data_read {
 
             kv_self.head = 0;
             kv_self.used = cell_count;
+            kv_self.cell_hwm = cell_count;
         }
 
         return true;
