@@ -30687,6 +30687,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_numa_thread_affinity(state->ith);
     set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
 
+#if defined(__SSE__) && !defined(__riscv)
+    // FTZ | DAZ: denormal operands are very slow on Intel (microcode assist)
+    _mm_setcsr(_mm_getcsr() | 0x8040);
+#endif
+
     struct ggml_compute_params params = {
         /*.ith   =*/ state->ith,
         /*.nth   =*/ state->shared->n_threads,
