@@ -13,7 +13,12 @@ These branches are a snapshot and will not be rebased. A newer base, if ever pub
 
 Numbers are per patch (A/B with and without it, or an isolated benchmark of the changed function), measured between 2026-11-07 and 11-13 on slightly different bases, most with the NUMA mirror patch applied. Re-measure on your own hardware.
 
-Test machine: 2x Xeon Gold 5220 (Cascade Lake, AVX-512 VNNI, 18 cores per socket used, no SMT), 128 GB, CPU only, `-t 32`. Not tested on AMD, ARM, Windows, macOS or GPU builds.
+Test machine: 2x Xeon Gold 5220 (Cascade Lake, 18 cores, 2.2 GHz base / 3.9 GHz turbo, AVX-512 VNNI, no AVX512_BF16). Memory: 12x 16 GB DDR4-2666 dual-rank RDIMM, one per channel, all 6 channels of each socket populated (192 GB). The runs use an LXC container limited to 36 cores (18 per socket) and 128 GB, CPU only, `-t 32`, no SMT. Measured here: one core copies about 3.9 GB/s (memcpy of 60 MiB); generation reaches about 98 GB/s effective with NUMA mirroring and about 62 GB/s with `numactl --interleave=all`. Not tested on AMD, ARM, Windows, macOS or GPU builds.
+
+How the numbers may transfer: this box has slow cores, low single-core bandwidth and two sockets, which makes some of these patches look bigger than they will on a desktop.
+
+- Patches that remove a fixed amount of work per token or per MTP round (per-step state restore, repetition penalties, the vocab sort, the qwen35 tokenizer) remove the same work everywhere, but that work costs less on fast cores. For example the 60 MiB state copy behind the restore patch takes 16-17 ms on one core here and about 3.5 ms on a Ryzen 7 PRO 5850U laptop core (17.5 GB/s), so the gain there is much smaller. Likewise, the sampler setup that the tokenizer patch speeds up took 1.7 ms per MTP round here and about 0.2 ms on that laptop.
+- The few-row quantization and small-batch flash-attention patches were measured only with two sockets and 32 threads. Their effect on a single socket, and the best thresholds for the flash-attention one, are unknown.
 
 ## cpu-perf-41d123e9
 
