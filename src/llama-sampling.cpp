@@ -543,24 +543,40 @@ void llama_sample_repetition_penalties_impl(
         token_count[last_tokens[i]]++;
     }
 
-    // Apply frequency and presence penalties to the candidates
-    for (size_t i = 0; i < candidates->size; ++i) {
-        const auto token_iter = token_count.find(candidates->data[i].id);
-        if (token_iter == token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
+    auto apply = [&](llama_token_data & cand, int count) {
         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (candidates->data[i].logit <= 0) {
-            candidates->data[i].logit *= penalty_repeat;
+        if (cand.logit <= 0) {
+            cand.logit *= penalty_repeat;
         } else {
-            candidates->data[i].logit /= penalty_repeat;
+            cand.logit /= penalty_repeat;
         }
 
-        candidates->data[i].logit -= float(count) * penalty_freq + float(count > 0) * penalty_present;
+        cand.logit -= float(count) * penalty_freq + float(count > 0) * penalty_present;
+    };
+
+    // candidates still indexed by token id: only touch the penalized entries
+    bool indexed = true;
+    for (const auto & [token, count] : token_count) {
+        if (token < 0 || (size_t) token >= candidates->size || candidates->data[token].id != token) {
+            indexed = false;
+            break;
+        }
+    }
+
+    if (indexed) {
+        for (const auto & [token, count] : token_count) {
+            apply(candidates->data[token], count);
+        }
+    } else {
+        // Apply frequency and presence penalties to the candidates
+        for (size_t i = 0; i < candidates->size; ++i) {
+            const auto token_iter = token_count.find(candidates->data[i].id);
+            if (token_iter == token_count.end()) {
+                continue;
+            }
+            apply(candidates->data[i], token_iter->second);
+        }
     }
 
     candidates->sorted = false;
