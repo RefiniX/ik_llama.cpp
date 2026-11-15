@@ -30779,6 +30779,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     int n_threads = cplan->n_threads;
 
+#if defined(__SSE__) && !defined(__riscv)
+    // the caller is worker 0, whose MXCSR ggml_graph_compute_thread() sets to FTZ/DAZ: restore it after the graph
+    const unsigned int saved_mxcsr = _mm_getcsr();
+#endif
+
 #if defined(__gnu_linux__)
     // the calling thread is worker 0 and gets pinned below; remember its affinity
     cpu_set_t saved_affinity;
@@ -30871,6 +30876,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     if (restore_affinity) {
         pthread_setaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity);
     }
+#endif
+
+#if defined(__SSE__) && !defined(__riscv)
+    _mm_setcsr(saved_mxcsr);
 #endif
 
     return state_shared.ec;
