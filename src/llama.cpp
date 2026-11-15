@@ -9558,7 +9558,10 @@ static void llama_mirror_model_weights_dense(const llama_model & model) {
         for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) continue;
             const char * name = ggml_get_name(t);
-            if (strstr(name, "_exps") || strstr(name, "token_embd") || strstr(name, "per_layer")) continue;
+            // A model without output.weight projects with its own copy of token_embd (TENSOR_DUPLICATED). That
+            // copy is read in full for every token, unlike the one used for the embedding lookup.
+            const bool is_output = t == model.output;
+            if (!is_output && (strstr(name, "_exps") || strstr(name, "token_embd") || strstr(name, "per_layer"))) continue;
             if (ggml_nbytes(t) < 4096) continue; // norms, biases: tiny, not worth a page each
             sel.push_back(t); total += ggml_nbytes(t); ++n_sel;
         }
