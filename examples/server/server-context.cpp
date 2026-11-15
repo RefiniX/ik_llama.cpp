@@ -4778,6 +4778,12 @@ void server_context::speculative_decoding_accept() {
         if (rewind_failed) {
             continue;
         }
+        // speculative decoding emits most tokens here: take interval checkpoints like process_batch_tokens(),
+        // but only while the context holds exactly the cached tokens (no stop inside the draft, no pending rewind)
+        if (slot.state == SLOT_STATE_PROCESSING && slot.ctx_sampling->n_rewind == 0 &&
+                llama_kv_cache_seq_pos_max(slot.ctx, slot.id) + 1 == slot.cache_tokens.pos_next()) {
+            create_checkpoint_at_interval(slot);
+        }
         SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int)ids.size() - 1, (int)slot.drafted.size(), slot.n_past);
         LOG_VERBOSE("speculative decoding result", {
             {"id_slot", slot.id},
