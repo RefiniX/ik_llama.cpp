@@ -11893,10 +11893,56 @@ static bool dsv4_stream_offset_size(const struct ggml_tensor * tensor, uint32_t 
 }
 
 // TODO: replace all non-fatal assertions with returned errors or exceptions
+// The large host copies of a state save / restore into / from memory, run together on a few threads. One thread
+// copies about 3 GB/s here (interleaved NUMA memory, fresh destination pages), and a context checkpoint of a
+// hybrid model is 60-120 MiB, taken at least twice per request. The bytes are the same as copying one by one.
+struct llama_state_copies {
+    static constexpr size_t k_min_size = 256*1024;
+    struct job { uint8_t * dst; const uint8_t * src; size_t size; };
+    std::vector<job> jobs;
+    size_t total = 0;
+
+    // a tensor whose bytes are its data in a plain CPU buffer (not a mirrored or repacked buffer type)
+    static bool plain_cpu(const ggml_tensor * t) {
+        return t->buffer && !t->extra && ggml_backend_buffer_get_type(t->buffer) == ggml_backend_cpu_buffer_type();
+    }
+    void add(void * dst, const void * src, size_t size) {
+        jobs.push_back({(uint8_t *) dst, (const uint8_t *) src, size});
+        total += size;
+    }
+    void run() {
+        if (jobs.empty()) return;
+        const int nth = (int) std::min<size_t>(8, std::max<size_t>(1, total/(8u << 20)));
+        auto work = [this, nth] (int ith) {
+            const size_t per = (total + nth - 1)/nth;
+            const size_t b = per*ith, e = std::min(total, b + per);
+            size_t off = 0;
+            for (const auto & j : jobs) {
+                const size_t jb = off, je = off + j.size;
+                off = je;
+                const size_t lo = std::max(b, jb), hi = std::min(e, je);
+                if (lo < hi) memcpy(j.dst + (lo - jb), j.src + (lo - jb), hi - lo);
+            }
+        };
+        if (nth == 1) {
+            work(0);
+        } else {
+            std::vector<std::thread> workers;
+            for (int t = 1; t < nth; ++t) workers.emplace_back(work, t);
+            work(0);
+            for (auto & w : workers) w.join();
+        }
+        jobs.clear();
+        total = 0;
+    }
+};
+
 struct llama_data_write {
     virtual void write(const void * src, size_t size) = 0;
     virtual void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size, int il) = 0;
     virtual size_t get_size_written() = 0;
+    // complete the copies a writer deferred (llama_data_write_buffer)
+    virtual void flush() {}
     virtual ~llama_data_write() = default;
 
     void write_string(const std::string & str) {
@@ -12521,6 +12567,11 @@ struct llama_data_read {
     virtual const uint8_t * read(size_t size) = 0;
     virtual void read_to(void * dst, size_t size) = 0;
     virtual size_t get_size_read() = 0;
+    // write a cache tensor from read() data; llama_data_read_buffer defers large copies to flush()
+    virtual void set_tensor(ggml_tensor * t, const void * src, size_t offset, size_t size) {
+        ggml_backend_tensor_set(t, src, offset, size);
+    }
+    virtual void flush() {}
     virtual ~llama_data_read() = default;
 
     void read_string(std::string & str) {
@@ -12870,6 +12921,8 @@ struct llama_data_read {
     }
 
     bool read_kv_cache_data(struct llama_context * ctx, uint32_t cell_count, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) {
+        // copies deferred by set_tensor() complete on every way out, as the immediate writes they replace would have
+        struct flush_on_exit { llama_data_read & d; ~flush_on_exit() { d.flush(); } } flush_guard{*this};
         const struct llama_hparams & hparams = ctx->model.hparams;
         struct llama_kv_cache & kv_self = ctx->kv_self;
         bool need_kv = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
@@ -12956,7 +13009,7 @@ struct llama_data_read {
                 if (kv_self.k_l[il]->extra) {
                     read_kv_cache_data_split(ctx, kv_self.k_l[il], read(k_rows * k_size_row), k_dst, k_size_row, k_rows, il);
                 } else {
-                    ggml_backend_tensor_set(kv_self.k_l[il], read(k_rows * k_size_row), k_dst * k_size_row, k_rows * k_size_row);
+                    set_tensor(kv_self.k_l[il], read(k_rows * k_size_row), k_dst * k_size_row, k_rows * k_size_row);
                 }
             }
         }
@@ -13007,7 +13060,7 @@ struct llama_data_read {
                     if (kv_self.v_l[il]->extra) {
                         read_kv_cache_data_split(ctx, kv_self.v_l[il], read(v_rows * v_size_row), v_dst, v_size_row, v_rows, il);
                     } else {
-                        ggml_backend_tensor_set(kv_self.v_l[il], read(v_rows * v_size_row), v_dst * v_size_row, v_rows * v_size_row);
+                        set_tensor(kv_self.v_l[il], read(v_rows * v_size_row), v_dst * v_size_row, v_rows * v_size_row);
                     }
                 }
             }
@@ -13078,7 +13131,7 @@ struct llama_data_read {
                     const uint32_t kv_size = kv_self.rows((int) il);
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                         const size_t dst_offset = (v_dst + (size_t) j * kv_size) * v_size_el;
-                        ggml_backend_tensor_set(kv_self.v_l[il], read(v_rows * v_size_el), dst_offset, v_rows * v_size_el);
+                        set_tensor(kv_self.v_l[il], read(v_rows * v_size_el), dst_offset, v_rows * v_size_el);
                     }
                 }
             }
@@ -13152,7 +13205,7 @@ struct llama_data_read {
                     if (kv_self.s_l[il]->extra) {
                         read_kv_cache_data_split(ctx, kv_self.s_l[il], read(s_data_size), s_dst_row, s_size_row, s_rows, il);
                     } else {
-                        ggml_backend_tensor_set(kv_self.s_l[il], read(s_data_size), s_dst_offset, s_data_size);
+                        set_tensor(kv_self.s_l[il], read(s_data_size), s_dst_offset, s_data_size);
                     }
                 }
             }
@@ -13254,11 +13307,13 @@ struct llama_data_read {
                     if (kv_self.kr_l[il]->extra) {
                         read_kv_cache_data_split(ctx, kv_self.kr_l[il], read(cell_count * kr_size_row), kv_self.head, kr_size_row, cell_count, il);
                     } else {
-                        ggml_backend_tensor_set(kv_self.kr_l[il], read(cell_count * kr_size_row), kv_self.head * kr_size_row, cell_count * kr_size_row);
+                        set_tensor(kv_self.kr_l[il], read(cell_count * kr_size_row), kv_self.head * kr_size_row, cell_count * kr_size_row);
                     }
                 }
             }
         }
+
+        flush();
 
         // the pooled block keys are derived from the indexer keys restored just above, and the
         // builder rebuilds only the blocks an ubatch writes into, so the next graph must pool
@@ -13536,12 +13591,19 @@ struct llama_data_write_buffer : llama_data_write {
         buf_size -= size;
     }
 
+    llama_state_copies copies;
+
+    void flush() override { copies.run(); }
+
     void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size, int il) override {
         if (size > buf_size) {
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
         if (tensor->extra) {
             get_tensor_data_split(tensor, offset, size, il);
+        } else if (size >= llama_state_copies::k_min_size && llama_state_copies::plain_cpu(tensor)) {
+            // the tensors are not written while the state is saved: copy at flush()
+            copies.add(ptr, (const char *) tensor->data + offset, size);
         } else {
             ggml_backend_tensor_get(tensor, ptr, offset, size);
         }
@@ -13673,6 +13735,18 @@ struct llama_data_read_buffer : llama_data_read {
     size_t get_size_read() override {
         return size_read;
     }
+
+    // read() points into the caller's buffer, which outlives the restore: the copies can wait for flush()
+    llama_state_copies copies;
+
+    void set_tensor(ggml_tensor * t, const void * src, size_t offset, size_t size) override {
+        if (size >= llama_state_copies::k_min_size && llama_state_copies::plain_cpu(t)) {
+            copies.add((char *) t->data + offset, src, size);
+        } else {
+            ggml_backend_tensor_set(t, src, offset, size);
+        }
+    }
+    void flush() override { copies.run(); }
 };
 
 struct llama_data_write_file : llama_data_write {
@@ -13800,6 +13874,7 @@ static size_t llama_state_get_data_internal(struct llama_context * ctx, llama_da
     data_ctx.write_embeddings(ctx);
 
     data_ctx.write_kv_cache(ctx);
+    data_ctx.flush();
 
     return data_ctx.get_size_written();
 }
@@ -13955,6 +14030,7 @@ static size_t llama_state_seq_get_data_internal(struct llama_context * ctx, llam
     llama_synchronize(ctx);
 
     data_ctx.write_kv_cache(ctx, seq_id, flags);
+    data_ctx.flush();
 
     return data_ctx.get_size_written();
 }
