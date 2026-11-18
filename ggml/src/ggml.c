@@ -5208,6 +5208,27 @@ static struct {
 
 static GGML_THREAD_LOCAL int tl_numa_node = 0; // this thread's NUMA node (set in set_numa_thread_affinity)
 
+// Dissemination barrier, used instead of the two-level one above (GGML_NUMA_BARRIER=hier switches back).
+// In round k = 0, 1, ... thread i sets a flag of thread (i + 2^k) % nth and waits for its own flag of that round.
+// No cache line is written by more than one thread and there is no read-modify-write, so the cost per barrier
+// stays at a few cross-socket line transfers: 32 threads on a 2-socket Cascade Lake, no work in between,
+// 1.1 us against 2.8 us for the two-level barrier and 6.4 us for the flat one. Token generation of a large MoE
+// model runs ~3000 graph nodes per token, each ending with a barrier.
+// A flag holds a 64-bit epoch that only grows. Every thread of a graph passes the same number of barriers, so all
+// threads start a graph from the same base and agree on the epoch of each barrier.
+#define GGML_DISSEM_MAX_THREADS 512
+#define GGML_DISSEM_ROUNDS      10
+struct ggml_dissem_flag {
+    atomic_llong v;
+    char pad[64 - sizeof(atomic_llong)];
+};
+static struct ggml_dissem_flag * g_dissem[GGML_DISSEM_MAX_THREADS]; // GGML_DISSEM_ROUNDS flags per thread, on its node
+static long long g_dissem_base = 0;   // epoch reached by the previous graph
+static int g_barrier_dissem = 1;
+static GGML_THREAD_LOCAL int tl_bar_ith = 0;
+static GGML_THREAD_LOCAL int tl_bar_nth = 1;
+static GGML_THREAD_LOCAL long long tl_bar_epoch = 0;
+
 static inline void ggml_numa_spin_pause(void) {
 #if defined(__SSE3__)
     _mm_pause();
@@ -5216,7 +5237,22 @@ static inline void ggml_numa_spin_pause(void) {
 #endif
 }
 
+static void ggml_numa_dissem_barrier(void) {
+    const int i = tl_bar_ith, n = tl_bar_nth;
+    const long long e = ++tl_bar_epoch;
+    for (int k = 0, d = 1; d < n; ++k, d <<= 1) {
+        atomic_store_explicit(&g_dissem[(i + d) % n][k].v, e, memory_order_release);
+        while (atomic_load_explicit(&g_dissem[i][k].v, memory_order_acquire) < e) {
+            ggml_numa_spin_pause();
+        }
+    }
+}
+
 static void ggml_numa_hier_barrier(void) {
+    if (g_barrier_dissem) {
+        ggml_numa_dissem_barrier();
+        return;
+    }
     const int node    = tl_numa_node;
     const int node_nth = g_numa_barrier.node_nth[node];
 
@@ -5645,6 +5681,26 @@ static void ggml_numa_barrier_setup(int n_threads) {
     }
     g_numa_barrier.n_leaders = leaders;
     g_numa_barrier.active = 1;
+
+    const char * kind = getenv("GGML_NUMA_BARRIER");
+    g_barrier_dissem = !(kind && strcmp(kind, "hier") == 0);
+    if (g_barrier_dissem) {
+        if (n_threads > GGML_DISSEM_MAX_THREADS || (1 << GGML_DISSEM_ROUNDS) < n_threads) {
+            g_barrier_dissem = 0;
+            return;
+        }
+        for (int j = 0; j < n_threads; ++j) {
+            if (g_dissem[j]) continue;
+            // the flags a thread waits on live on its node (zeroed); a later graph with another thread count may
+            // leave them on the wrong node, which only costs speed
+            g_dissem[j] = (struct ggml_dissem_flag *) ggml_numa_alloc(GGML_DISSEM_ROUNDS*sizeof(struct ggml_dissem_flag),
+                    ggml_numa_node_for_thread(j, n_threads));
+            if (!g_dissem[j]) {
+                g_barrier_dissem = 0;
+                return;
+            }
+        }
+    }
 }
 
 void ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * node_data) {
@@ -31198,6 +31254,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     int64_t t_eval  = 0;
 #endif
 
+    tl_bar_ith   = state->ith;
+    tl_bar_nth   = state->shared->n_threads;
+    tl_bar_epoch = g_dissem_base;
+
     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -31226,6 +31286,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     int64_t t_end = ggml_time_us();
     if (state->ith == 0) printf("ggml_barrier(...): %d us\n", (int)(t_end - t_start - t_eval));
 #endif
+    // every thread passed the same barriers, and all of them read the old base before the first one
+    if (state->ith == 0) g_dissem_base = tl_bar_epoch;
 
     return 0;
 }
