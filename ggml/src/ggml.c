@@ -19421,6 +19421,68 @@ static bool ggml_src1_plain_rows(enum ggml_type vec_dot_type, int64_t ne10) {
 // of them: every thread of the following matmul reads the quantized rows, and rows written by other cores are read
 // from their modified cache lines, which costs more than the parallel quantization saves.
 // Returns false when this does not apply; the caller then splits by rows as before.
+// A tiny MUL_MAT that follows a MUL_MAT on the same src1 but needs another vec_dot_type (qwen4exp: hc_inject, 4 rows,
+// after mix_down, 320 rows repacked to IQ4_XS_R8; ssm_alpha, 48 rows) used to be its own node: one more quantization of
+// src1 by thread 0, two more barriers, and a few rows of work. It is now computed at the end of the previous node by
+// the last threads, which quantize src1 into their own buffer. In token generation those threads usually have no
+// work in the previous node (40 row units on 32 threads leave 12 idle).
+#define GGML_TINY_NEXT_MAX_ROWS 64
+#define GGML_TINY_NEXT_MAX_COLS 8
+
+static GGML_THREAD_LOCAL char * tl_q_buf = NULL;
+static GGML_THREAD_LOCAL size_t tl_q_size = 0;
+
+static bool ggml_src1_plain_rows(enum ggml_type vec_dot_type, int64_t ne10);
+
+static bool ggml_tiny_next_ok(const struct ggml_tensor * dst_next, const struct ggml_tensor * src1, enum ggml_type vec_dot_type) {
+    if (dst_next->op != GGML_OP_MUL_MAT || dst_next->src[1] != src1 || dst_next->type != GGML_TYPE_F32) return false;
+    const struct ggml_tensor * a = dst_next->src[0];
+    const enum ggml_type vdt = type_traits[a->type].vec_dot_type;
+    if (vdt == vec_dot_type || vdt == GGML_TYPE_F32 || !type_traits[vdt].from_float) return false;
+    if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) return false;
+    if (a->ne[1] > GGML_TINY_NEXT_MAX_ROWS || a->ne[2] != 1 || a->ne[3] != 1) return false;
+    if (src1->ne[1] > GGML_TINY_NEXT_MAX_COLS || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+    if (a->ne[0] != src1->ne[0] || src1->ne[0] % ggml_blck_size(vdt) != 0) return false;
+    if (!ggml_src1_plain_rows(vdt, src1->ne[0])) return false;
+    return true;
+}
+
+static void ggml_tiny_next_compute(struct ggml_tensor * dst_next, int numa_node, int ith, int nth) {
+    const struct ggml_tensor * a    = dst_next->src[0];
+    const struct ggml_tensor * src1 = dst_next->src[1];
+    const int64_t nr = a->ne[1];
+    // every helper quantizes src1 on its own, so use few: one per 8 rows (an interleaved row group), at least one
+    const int nhelp = (int)MIN((int64_t)nth, MAX((int64_t)1, nr/8));
+    const int j = nth - 1 - ith;
+    if (j >= nhelp) return;
+    const enum ggml_type vdt = type_traits[a->type].vec_dot_type;
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1];
+    const size_t row_size = ggml_row_size(vdt, ne10);
+    const size_t need = row_size*ne11;
+    if (tl_q_size < need) {
+        free(tl_q_buf);
+        tl_q_buf = (char *)malloc(need + 64);
+        GGML_ASSERT(tl_q_buf);
+        tl_q_size = need;
+    }
+    ggml_from_float_t from_float = type_traits[vdt].from_float;
+    for (int64_t i11 = 0; i11 < ne11; ++i11) {
+        from_float((const float *)((const char *)src1->data + i11*src1->nb[1]), tl_q_buf + i11*row_size, ne10);
+    }
+    const void * a_data = ggml_numa_tensor_data(a, numa_node);
+#if GGML_USE_IQK_MULMAT
+    if (!iqk_mul_mat_4d(nr, ne11, a->ne[0], 1, 1, 1, 1, a->nb[2], a->nb[3], row_size*ne11, row_size*ne11,
+                dst_next->nb[2]/sizeof(float), dst_next->nb[3]/sizeof(float),
+                a->type, a_data, a->nb[1], vdt, tl_q_buf, row_size,
+                (float *)dst_next->data, dst_next->nb[1]/sizeof(float), j, nhelp)) {
+        GGML_ABORT("%s: no IQK kernel for %s", __func__, ggml_type_name(a->type));
+    }
+#else
+    GGML_UNUSED(a_data); GGML_UNUSED(row_size);
+    GGML_ABORT("%s: needs IQK", __func__);
+#endif
+}
+
 static bool ggml_quantize_src1_few_rows(const struct ggml_tensor * src1, enum ggml_type vec_dot_type,
         ggml_from_float_t from_float, char * wdata, size_t nbw1, size_t nbw2, size_t nbw3, int ith, int nth) {
     if (src1->type != GGML_TYPE_F32 || !from_float) return false;
@@ -19688,6 +19750,10 @@ static int ggml_compute_forward_mul_mat(
                     src0_next->type, src0_next_data, src0_next->nb[1],
                     vec_dot_type, wdata, row_size,
                     (float *)dst_next->data, dst_next->nb[1]/sizeof(float), ith, nth)) break;
+                ++node_n;
+            }
+            if (node_n < cgraph->n_nodes - 1 && ggml_tiny_next_ok(cgraph->nodes[node_n+1], src1, vec_dot_type)) {
+                ggml_tiny_next_compute(cgraph->nodes[node_n+1], numa_node, ith, nth);
                 ++node_n;
             }
             return node_n;
@@ -20822,6 +20888,58 @@ static void ggml_compute_forward_out_prod(
 }
 
 // ggml_compute_forward_scale
+
+// SCALE (no bias) followed by SILU of its result: the same 1024-value blocks and arithmetic as the two separate
+// nodes, without the barrier in between (qwen4exp: mix_down_scaled -> mix_down_silu, twice per layer)
+static bool ggml_fused_scale_silu(const struct ggml_compute_params * params, struct ggml_tensor * sc, struct ggml_tensor * un) {
+    if (un->op != GGML_OP_UNARY || un->src[0] != sc || (enum ggml_unary_op)un->op_params[0] != GGML_UNARY_OP_SILU) return false;
+    const struct ggml_tensor * src0 = sc->src[0];
+    if (src0->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(sc) || !ggml_is_contiguous(un)) return false;
+    if (!ggml_are_same_shape(src0, sc) || !ggml_are_same_shape(sc, un)) return false;
+    float s, b;
+    memcpy(&s, (const float *)sc->op_params + 0, sizeof(float));
+    memcpy(&b, (const float *)sc->op_params + 1, sizeof(float));
+    if (b != 0.0f || s == 0.0f) return false;
+    const int64_t block_size = 1024; // as in ggml_compute_forward_scale_f32 and the contiguous SILU path
+    const int64_t nelements = ggml_nelements(sc);
+    const int64_t nblocks = (nelements + block_size - 1)/block_size;
+    for (int64_t ib = params->ith; ib < nblocks; ib += params->nth) {
+        const float * x = (const float *)src0->data + block_size*ib;
+              float * t = (      float *)sc->data   + block_size*ib;
+              float * y = (      float *)un->data   + block_size*ib;
+        const int n = (int)MIN(block_size, nelements - block_size*ib);
+        if (t != x) memcpy(t, x, n*sizeof(float));
+        ggml_vec_scale_f32(n, t, s);
+        ggml_vec_silu_f32(n, y, t);
+    }
+    return true;
+}
+
+// MULTI_ADD followed by SCALE (no bias) of its result: each thread scales the rows it just summed
+// (qwen4exp: the mean of the hc streams, twice per layer)
+static bool ggml_fused_multi_add_scale(const struct ggml_compute_params * params, struct ggml_tensor * ma, struct ggml_tensor * sc) {
+    if (sc->op != GGML_OP_SCALE || sc->src[0] != ma) return false;
+    if (ma->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(ma) || !ggml_is_contiguous(sc) || !ggml_are_same_shape(ma, sc)) return false;
+    float s, b;
+    memcpy(&s, (const float *)sc->op_params + 0, sizeof(float));
+    memcpy(&b, (const float *)sc->op_params + 1, sizeof(float));
+    if (b != 0.0f || s == 0.0f) return false;
+    ggml_compute_forward_multi_add(params, ma);
+    const int nr  = ggml_nrows(ma);
+    const int dr  = (nr + params->nth - 1)/params->nth;
+    const int ir0 = dr*params->ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+    const int64_t ne0 = ma->ne[0];
+    for (int i1 = ir0; i1 < ir1; ++i1) {
+        const float * x = (const float *)((const char *)ma->data + i1*ma->nb[1]);
+              float * y = (      float *)((      char *)sc->data + i1*sc->nb[1]);
+        if (y != x) memcpy(y, x, ne0*sizeof(float));
+        ggml_vec_scale_f32((int)ne0, y, s);
+    }
+    return true;
+}
 
 static void ggml_compute_forward_scale_f32(
         const struct ggml_compute_params * params,
@@ -28558,6 +28676,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             } break;
         case GGML_OP_MULTI_ADD:
             {
+                if (i + 1 < cgraph->n_nodes && ggml_fused_multi_add_scale(params, tensor, cgraph->nodes[i+1])) {
+                    i += 1;
+                    break;
+                }
                 ggml_compute_forward_multi_add(params, tensor);
             } break;
         case GGML_OP_MUL_MULTI_ADD:
@@ -28713,6 +28835,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
                     cgraph->nodes[i+2]->src[0] == cgraph->nodes[i+1] &&
                     iqk_op_scale_unary_scale(cgraph->nodes[i+2], params->ith, params->nth)) {
                     i += 2;
+                    break;
+                }
+                if (i + 1 < cgraph->n_nodes && ggml_fused_scale_silu(params, tensor, cgraph->nodes[i+1])) {
+                    i += 1;
                     break;
                 }
                 ggml_compute_forward_scale(params, tensor);
