@@ -19196,12 +19196,35 @@ static void ggml_tiny_next_compute(struct ggml_tensor * dst_next, int numa_node,
 #endif
 }
 
+#define GGML_QSPLIT_THREADS    4
+#define GGML_QSPLIT_MIN_VALUES 40000
+
 static bool ggml_quantize_src1_few_rows(const struct ggml_tensor * src1, enum ggml_type vec_dot_type,
         ggml_from_float_t from_float, char * wdata, size_t nbw1, size_t nbw2, size_t nbw3, int ith, int nth) {
     if (src1->type != GGML_TYPE_F32 || !from_float) return false;
     const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
     const int64_t nr1  = ne11*ne12*ne13;
     if (nr1 >= nth || !ggml_src1_plain_rows(vec_dot_type, ne10)) return false;
+    // A large input (qwen4exp mix_down during MTP verification: 6 x 10240 values) took thread 0 long enough to stall
+    // the node. Split it in 256-value blocks over the first few threads, which are on the same node; more writers made
+    // the following mat-mul slower again (8 threads: no gain, 16: +11%). Q8_K / Q8_K32 rows are plain block sequences,
+    // so the bytes are the same.
+    if (nr1*ne10 >= GGML_QSPLIT_MIN_VALUES && (vec_dot_type == GGML_TYPE_Q8_K || vec_dot_type == GGML_TYPE_Q8_K32) &&
+        ggml_is_contiguous(src1) && ne10 % QK_K == 0) {
+        const int k = MIN(GGML_QSPLIT_THREADS, nth);
+        if (ith >= k) return true;
+        const int64_t nb  = ne10/QK_K;                // blocks per row
+        const int64_t tot = nb*nr1;
+        const int64_t b0 = tot*ith/k, b1 = tot*(ith + 1)/k;
+        const size_t bsz = ggml_row_size(vec_dot_type, QK_K);
+        for (int64_t b = b0; b < b1; ) {
+            const int64_t r = b/nb, bi = b - r*nb;
+            const int64_t n = MIN(b1 - b, nb - bi);   // stay inside one row
+            from_float((const float *)src1->data + r*ne10 + bi*QK_K, (void *)(wdata + r*nbw1 + bi*bsz), n*QK_K);
+            b += n;
+        }
+        return true;
+    }
     if (ith != 0) return true;
     for (int64_t ir1 = 0; ir1 < nr1; ++ir1) {
         const int64_t i13 = ir1/(ne11*ne12);
