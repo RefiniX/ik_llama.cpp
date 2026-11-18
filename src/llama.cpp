@@ -9604,13 +9604,106 @@ static void llama_mirror_model_weights_dense(const llama_model & model) {
             __func__, model.numa_mirror_bufs.size(), n_nodes);
 }
 
+// [EXPERIMENTAL] LLAMA_NUMA_EXPERT_ROWS=1 with --numa-mirror dense: keep the single copy of the routed experts, but place
+// each expert's rows on the node whose threads compute them. With mirroring, thread ith runs on node (ith*n_nodes)/nth,
+// and the MoE kernels give every thread a contiguous block of row units of each active expert: the fused up/gate kernel
+// units [nunit*ith/nth, nunit*(ith+1)/nth) (split_units_and_columns without y split), the mul_mat_id kernel (down)
+// [ith*ceil(nunit/nth), (ith+1)*ceil(nunit/nth)). Binding those ranges to the thread's node turns the expert reads of
+// token generation local. Placement only: computation is unchanged; a wrong guess only costs speed. Assumes -t == -tb.
+static void llama_numa_place_expert_rows(const llama_model & model, int nth) {
+    const int n_nodes = ggml_numa_node_count();
+    if (n_nodes < 2 || nth < n_nodes) return;
+    std::vector<int> first(n_nodes + 1);   // first thread of node k: smallest ith with (ith*n_nodes)/nth == k
+    for (int k = 0; k <= n_nodes; ++k) first[k] = (k*nth + n_nodes - 1)/n_nodes;
+    const uintptr_t pg = 4096;
+    size_t bytes[GGML_NUMA_MAX_NODES] = {0};
+    int n_t = 0, n_skip = 0;
+    bool logged_gu = false, logged_down = false;
+    ggml_tensor * probe = nullptr; std::vector<int64_t> probe_ub; int probe_nr = 0;
+    for (struct ggml_context * ctx : model.ctxs) {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) continue;
+            const char * name = ggml_get_name(t);
+            if (!strstr(name, "_exps") || ggml_n_dims(t) != 3) continue;
+            const bool down = strstr(name, "ffn_down_exps") != nullptr;
+            const bool gu   = strstr(name, "ffn_gate_exps") != nullptr || strstr(name, "ffn_up_exps") != nullptr;
+            const int  nr   = ggml_cpu_mul_mat_rows_per_unit(t->type);
+            if ((!down && !gu) || nr <= 0 || t->ne[1] % nr != 0) { ++n_skip; continue; }
+            const int64_t nunit = t->ne[1]/nr;
+            std::vector<int64_t> ub(n_nodes + 1);
+            for (int k = 0; k <= n_nodes; ++k) {
+                const int64_t ith = first[k];
+                ub[k] = down ? std::min<int64_t>(ith*((nunit + nth - 1)/nth), nunit) : nunit*ith/nth;
+            }
+            ub[n_nodes] = nunit;
+            if ((down && !logged_down) || (gu && !logged_gu)) {
+                std::string s; for (int k = 0; k <= n_nodes; ++k) s += " " + std::to_string(ub[k]*nr);
+                LLAMA_LOG_INFO("%s: NUMA expert rows: %s (%s, %d rows/unit, %lld units): node row boundaries%s\n",
+                        __func__, name, ggml_type_name(t->type), nr, (long long) nunit, s.c_str());
+                (down ? logged_down : logged_gu) = true;
+            }
+#if defined(__linux__)
+            // Moving already-populated pages does not work here: the weights sit in 2 MiB transparent huge pages and
+            // half an expert is far smaller, so mbind(MPOL_MF_MOVE) on part of a huge page leaves it where it is.
+            // Instead copy the tensor into a fresh 4 KiB-page mapping whose per-node row ranges are bound BEFORE the
+            // first touch (the copy then allocates every page on its bound node), point the tensor at it and release
+            // the old pages. One tensor at a time, so the extra memory is at most one expert tensor.
+            const size_t sz = ggml_nbytes(t);
+            void * fresh = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (fresh == MAP_FAILED) { ++n_skip; continue; }
+            madvise(fresh, sz, MADV_NOHUGEPAGE);
+            for (int64_t e = 0; e < t->ne[2]; ++e) {
+                const char * base = (const char *) fresh + e*t->nb[2];
+                for (int k = 0; k < n_nodes; ++k) {
+                    const uintptr_t s0 = (uintptr_t) (base + ub[k]*nr*t->nb[1]), s1 = (uintptr_t) (base + ub[k+1]*nr*t->nb[1]);
+                    const uintptr_t ps = (s0 + pg - 1) & ~(pg - 1), pe = s1 & ~(pg - 1);   // whole pages only
+                    if (pe > ps) { ggml_numa_bind((void *) ps, pe - ps, k); bytes[k] += pe - ps; }
+                }
+            }
+            memcpy(fresh, t->data, sz);
+            {   // release the whole pages of the old copy (the partial pages at both ends may hold neighbouring tensors)
+                const uintptr_t ob = (uintptr_t) t->data, oe = ob + sz;
+                const uintptr_t pb = (ob + pg - 1) & ~(pg - 1), pe = oe & ~(pg - 1);
+                if (pe > pb) madvise((void *) pb, pe - pb, MADV_DONTNEED);
+            }
+            t->data = fresh;   // never unmapped: the model lives until the process exits (experimental)
+#else
+            ++n_skip; continue;
+#endif
+            if (!probe) { probe = t; probe_ub = ub; probe_nr = nr; }
+            ++n_t;
+        }
+    }
+    std::string s; for (int k = 0; k < n_nodes; ++k) s += " node" + std::to_string(k) + " " + std::to_string(bytes[k] >> 20) + " MiB";
+    LLAMA_LOG_INFO("%s: NUMA expert rows: placed %d expert tensors (%d skipped):%s\n", __func__, n_t, n_skip, s.c_str());
+    if (probe) {   // check: where do the pages of expert 0's per-node row ranges live now?
+        for (int k = 0; k < n_nodes; ++k) {
+            const char * base = (const char *) probe->data;
+            int counts[GGML_NUMA_MAX_NODES];
+            const int q = ggml_numa_query_pages(base + probe_ub[k]*probe_nr*probe->nb[1], (probe_ub[k+1] - probe_ub[k])*probe_nr*probe->nb[1], counts);
+            std::string c; for (int j = 0; j < n_nodes; ++j) c += " node" + std::to_string(j) + "=" + std::to_string(counts[j]);
+            LLAMA_LOG_INFO("%s: NUMA expert rows: check %s expert 0, rows for node %d: %d pages:%s\n", __func__, ggml_get_name(probe), k, q, c.c_str());
+        }
+    }
+}
+
 // Duplicate the model's host weight buffers once per NUMA node and point each weight tensor at its
 // per-node copies (see ggml_numa_tensor_data). Must run AFTER all weight repacking (load-time and
 // the context-time up/gate merge) so the mirrored bytes are final. Idempotent per model.
-static void llama_mirror_model_weights(const llama_model & model) {
+static void llama_mirror_model_weights(const llama_model & model, int n_threads) {
+    // expert row placement: once per model; needs threads pinned per node (--numa mirror) and no full weight mirror
+    static std::set<const llama_model *> rows_placed;
+    const char * env = getenv("LLAMA_NUMA_EXPERT_ROWS");
+    const bool rows = env && atoi(env) != 0 && ggml_numa_mirror_active() && !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS) &&
+                      ggml_numa_node_count() >= 2 && rows_placed.insert(&model).second;
     if (ggml_numa_mirror_active() && !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS) &&
             (ggml_numa_get_mirror() & GGML_NUMA_MIRROR_DENSE) && model.numa_mirror_bufs.empty() && ggml_numa_node_count() >= 2) {
         llama_mirror_model_weights_dense(model);
+        if (rows) llama_numa_place_expert_rows(model, n_threads);
+        return;
+    }
+    if (rows) {   // --numa-mirror none: threads pinned per node, no per-node copies, experts placed by rows
+        llama_numa_place_expert_rows(model, n_threads);
         return;
     }
     if (!ggml_numa_mirror_active() || !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS)) {
@@ -10665,7 +10758,7 @@ struct llama_context * llama_init_from_model(
             llama_repack_up_gate_exps(*ctx);
 
             // NUMA mirror: duplicate the (now final) weights per node before building graphs
-            llama_mirror_model_weights(ctx->model);
+            llama_mirror_model_weights(ctx->model, cparams.n_threads);
             if (cparams.moe_cache_size > 0) {
                 try {
                     ctx->moe_cache = std::make_unique<llama_moe_cache>(*model, ctx->backends, backend_buft,

@@ -39,6 +39,8 @@ IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int ne11, int un
 
 IQK_API int iqk_dequant_type(int type, int Ny);
 
+IQK_API int iqk_num_rows(int type);
+
 struct ggml_tensor;
 
 IQK_API size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nthread);

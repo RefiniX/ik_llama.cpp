@@ -608,6 +608,11 @@ extern "C" IQK_API int iqk_dequant_type(int type, int Ny) {
     return MulMat::is_dequant_better(ggml_type(type), Ny);
 }
 
+// Rows per work unit of the matmul kernels for this weight type (row-interleaved repacked types: 4, 8, 16).
+extern "C" IQK_API int iqk_num_rows(int type) {
+    return MulMat::num_rows(ggml_type(type));
+}
+
 template <typename Work>
 static void split_units_and_columns(int nunit, int nrow, int Ny, int max_units, bool split_y, int ith, int nth, const Work& work) {
     constexpr int k_y_blk = 8;
