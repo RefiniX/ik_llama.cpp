@@ -381,6 +381,61 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                          this_qkv, nullptr, nullptr)) return false;
                 return true;
             }
+            if (barrier && neq1 < nth) {
+                // Fewer query rows than threads (MTP verification): one thread per row left most threads idle.
+                // Gather all rows together, with the same content as the per-row loop below, then spread that loop's
+                // iqk_flash_attn_impl calls (row x KV head) over the threads. A KV head with a multiple of 4 q heads
+                // is cut into calls of 4: iqk_flash_helper then takes q_step = 4 instead of 8, 12 or 16, which
+                // computes each q row the same way (q_step 1 and 2 do not, so other cuts would change the result).
+                for (int iq = 0; iq < neq1; ++iq) {
+                    auto idx = (const int *)((const char *)indexer->data + iq*indexer->nb[1]);
+                    auto M = mask ? (const ggml_fp16_t *)((const char *)mask + iq*size_t(stride_m)) : nullptr;
+                    auto work_k = (char *)work_buffer_in + iq*work_size;
+                    auto work_v = work_k + row_size_k*indexer->ne[0];
+                    auto work_m = (ggml_fp16_t *)(work_v + row_size_v*indexer->ne[0]);
+                    for (int j = ith; j < nkv; j += nth) {
+                        if (idx[j] >= 0) {
+                            std::memcpy(work_k + row_size_k*j, ((const char *)k + idx[j]*stride_k), row_size_k);
+                            if (k != v) {
+                                std::memcpy(work_v + row_size_v*j, ((const char *)v + idx[j]*stride_v), row_size_v);
+                            }
+                            work_m[j] = M ? M[idx[j]] : h_zero;
+                        } else {
+                            std::memset(work_k + row_size_k*j, 0, row_size_k);
+                            if (k != v) {
+                                std::memset(work_v + row_size_v*j, 0, row_size_v);
+                            }
+                            work_m[j] = h_inf;
+                        }
+                    }
+                }
+                barrier(barrier_data);
+                const int rk2  = neq2/nek2;
+                const int nh   = rk2 > 4 && rk2 % 4 == 0 ? 4 : rk2;
+                const int nhc  = rk2/nh;
+                for (int u = ith; u < neq1*nek2*nhc; u += nth) {
+                    const int hc = u % nhc, ik2 = (u/nhc) % nek2, iq = u/(nhc*nek2);
+                    auto idx = (const int *)((const char *)indexer->data + iq*indexer->nb[1]);
+                    int last_found = -1;
+                    for (int j = nkv - 1; j >= 0; --j) if (idx[j] >= 0) { last_found = j; break; }
+                    if (last_found < 0) continue;
+                    ++last_found;
+                    int this_nkv = 32*((last_found + 31)/32);
+                    auto work_k = (char *)work_buffer_in + iq*work_size;
+                    auto work_v = work_k + row_size_k*indexer->ne[0];
+                    auto work_m = (ggml_fp16_t *)(work_v + row_size_v*indexer->ne[0]);
+                    const int h0 = ik2*rk2 + hc*nh;
+                    // as the per-row loop: every KV head group reads sinks from the same base
+                    if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
+                                Dk, Dv, nh, this_nkv, nbq2, row_size_k, row_size_v, 0, Dv,
+                                (const float *)((const char *)q + iq*stride_q + h0*nbq2),
+                                work_k + ik2*row_size_k/nek2,
+                                k == v ? work_k + ik2*row_size_k/nek2: work_v + ik2*row_size_v/nek2,
+                                work_m, sinks ? (const float *)sinks + hc*nh : nullptr, 1, scale, softcap,
+                                qkv + iq*ne1*nb1/sizeof(float) + h0*nb1/sizeof(float), nullptr, nullptr)) return false;
+                }
+                return true;
+            }
             int npt = (neq1 + nth - 1)/nth;
             int ith_mid = nth;
             int neq1_this_thread = npt;
