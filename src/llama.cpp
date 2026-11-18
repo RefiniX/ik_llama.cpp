@@ -9725,7 +9725,7 @@ static void llama_mirror_model_weights_dense(const llama_model & model) {
             __func__, model.numa_mirror_bufs.size(), n_nodes);
 }
 
-// [EXPERIMENTAL] LLAMA_NUMA_EXPERT_ROWS=1 with --numa-mirror dense: keep the single copy of the routed experts, but place
+// --numa-mirror rows (or shard = dense,rows): keep the single copy of the routed experts, but place
 // each expert's rows on the node whose threads compute them. With mirroring, thread ith runs on node (ith*n_nodes)/nth,
 // and the MoE kernels give every thread a contiguous block of row units of each active expert: the fused up/gate kernel
 // units [nunit*ith/nth, nunit*(ith+1)/nth) (split_units_and_columns without y split), the mul_mat_id kernel (down)
@@ -9814,8 +9814,7 @@ static void llama_numa_place_expert_rows(const llama_model & model, int nth) {
 static void llama_mirror_model_weights(const llama_model & model, int n_threads) {
     // expert row placement: once per model; needs threads pinned per node (--numa mirror) and no full weight mirror
     static std::set<const llama_model *> rows_placed;
-    const char * env = getenv("LLAMA_NUMA_EXPERT_ROWS");
-    const bool rows = env && atoi(env) != 0 && ggml_numa_mirror_active() && !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS) &&
+    const bool rows = (ggml_numa_get_mirror() & GGML_NUMA_MIRROR_EXPERT_ROWS) && ggml_numa_mirror_active() && !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS) &&
                       ggml_numa_node_count() >= 2 && rows_placed.insert(&model).second;
     if (ggml_numa_mirror_active() && !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS) &&
             (ggml_numa_get_mirror() & GGML_NUMA_MIRROR_DENSE) && model.numa_mirror_bufs.empty() && ggml_numa_node_count() >= 2) {
@@ -9823,7 +9822,7 @@ static void llama_mirror_model_weights(const llama_model & model, int n_threads)
         if (rows) llama_numa_place_expert_rows(model, n_threads);
         return;
     }
-    if (rows) {   // --numa-mirror none: threads pinned per node, no per-node copies, experts placed by rows
+    if (rows) {   // --numa-mirror rows: threads pinned per node, no per-node copies, experts placed by rows
         llama_numa_place_expert_rows(model, n_threads);
         return;
     }

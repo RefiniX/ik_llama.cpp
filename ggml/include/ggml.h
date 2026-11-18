@@ -966,6 +966,7 @@ extern "C" {
         GGML_NUMA_MIRROR_KV          = 1 << 1, // K/V cache
         GGML_NUMA_MIRROR_ACTIVATIONS = 1 << 2, // reserved: per-node matmul scratch (not implemented)
         GGML_NUMA_MIRROR_DENSE       = 1 << 3, // only weights read in full every token (not routed experts / lookup tables)
+        GGML_NUMA_MIRROR_EXPERT_ROWS = 1 << 4, // no copy: place routed expert rows on the node whose threads compute them
         GGML_NUMA_MIRROR_ALL = GGML_NUMA_MIRROR_WEIGHTS | GGML_NUMA_MIRROR_KV,
     };
 
