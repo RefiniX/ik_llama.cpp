@@ -66,9 +66,9 @@ static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, lla
     ckpt.n_tokens = n_tokens;
 
     const size_t checkpoint_size = llama_state_seq_get_size(ctx, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-    ckpt.data.resize(checkpoint_size);
+    uint8_t * dst = ckpt.data.reset(checkpoint_size);
 
-    const size_t n = llama_state_seq_get_data(ctx, ckpt.data.data(), ckpt.data.size(), id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const size_t n = llama_state_seq_get_data(ctx, dst, checkpoint_size, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     if (n != checkpoint_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", checkpoint_size, n);
     }
@@ -2937,8 +2937,7 @@ static size_t load_checkpoints_from_file(const std::string & filename, std::list
             size_t data_len;
             file.read(reinterpret_cast<char *>(&data_len), sizeof(data_len));
             if (data_len > 0) {
-                checkpoint.data.resize(data_len);
-                file.read(reinterpret_cast<char *>(checkpoint.data.data()), data_len * sizeof(uint8_t));
+                file.read(reinterpret_cast<char *>(checkpoint.data.reset(data_len)), data_len * sizeof(uint8_t));
             }
             checkpoints.push_back(checkpoint);
         }

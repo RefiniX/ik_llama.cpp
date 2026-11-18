@@ -394,6 +394,28 @@ struct server_default_init_allocator : std::allocator<T> {
     }
 };
 
+// Checkpoint data shared by the copies of a checkpoint: saving a prompt to the RAM cache copies the slot's
+// checkpoint list, and the cached entry and the slot now point to the same bytes instead of each holding a copy
+// (same idea as mainline #30137). The bytes are never changed in place; writing goes through reset(), which gives
+// the checkpoint a buffer of its own when another copy still uses the current one.
+struct server_checkpoint_data {
+    using buffer = std::vector<uint8_t, server_default_init_allocator<uint8_t>>;
+    std::shared_ptr<buffer> buf;
+
+    size_t size() const { return buf ? buf->size() : 0; }
+    bool empty() const { return size() == 0; }
+    const uint8_t * data() const { return buf ? buf->data() : nullptr; }
+
+    // a writable buffer of n bytes (contents undefined), reusing the current one when no other copy uses it
+    uint8_t * reset(size_t n) {
+        if (!buf || buf.use_count() > 1) {
+            buf = std::make_shared<buffer>();
+        }
+        buf->resize(n);
+        return buf->data();
+    }
+};
+
 struct server_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
@@ -403,7 +425,7 @@ struct server_prompt_checkpoint {
     // the checkpoint taken at the end of the prompt; kept while another entry can be evicted instead
     bool prompt_end = false;
 
-    std::vector<uint8_t, server_default_init_allocator<uint8_t>> data;
+    server_checkpoint_data data;
 
     // disk-spill location when data was offloaded (empty = resident / no spill)
     std::string spill_path;
