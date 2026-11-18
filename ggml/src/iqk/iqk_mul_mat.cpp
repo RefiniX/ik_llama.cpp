@@ -2275,6 +2275,11 @@ template <int nrc_y> inline void iqk_mul_f32_f32_r(int n_per_row, int n_rows, si
 #endif
 }
 
+// One query row's scratch when several rows are selected in parallel: block scores, cell scores, and the
+// sorted / idx_inf / idx_aux / counts arrays of iqk_bucket_topk.
+static size_t iqk_topk_row_bytes(int64_t n_blocks, int64_t n_kv) {
+    return GGML_PAD((n_blocks + n_kv)*sizeof(float) + (3*n_kv + k_n_bucket)*sizeof(int32_t), 64);
+}
 size_t iqk_idx_topk_work_buffer_size(const struct ggml_tensor * dst, int nthread) {
     auto k = dst->src[0];
     auto q = dst->src[1];
@@ -2305,6 +2310,9 @@ size_t iqk_idx_topk_work_buffer_size(const struct ggml_tensor * dst, int nthread
     size += n_kv * sizeof(float);
     size += n_kv * sizeof(int32_t);
     size += (size_t(2)*n_kv + k_n_bucket)*sizeof(int);
+    if (q->ne[2] > 1 && dst->op_params[2] == 0) {
+        size += q->ne[2]*iqk_topk_row_bytes(k->ne[1], n_kv) + 64;
+    }
     if (dst->op_params[2] != 0) {
         const int n_b = n_kv/(int) dst->op_params[1];
         size += n_b * sizeof(float);
@@ -2606,6 +2614,56 @@ bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t ba
     auto counts  = idx_aux + n_kv;
     auto group_score = (float *)(counts + k_n_bucket);
     auto kept = (uint32_t *)(group_score + n_b);
+
+    // Several query rows (MTP verification): the selection below runs on thread 0, one row after the other, and
+    // costs about 1 ms per row at 32k cells. Score every row first, then run the same iqk_bucket_topk for row r on
+    // thread r with its own scratch: each row gets the same indices in the same order.
+    if (!select_groups && q->ne[2] > 1) {
+        const int nrows = q->ne[2];
+        auto rows_base = (char *)GGML_PAD((uintptr_t)(kept + (n_b + 31)/32), 64);
+        const size_t row_bytes = iqk_topk_row_bytes(k->ne[1], n_kv);
+        auto row_score = [&] (int r) { return (float *)(rows_base + r*row_bytes); };
+        for (int iq = 0; iq < nrows; ++iq) {
+            if (n_this_thread > 0) {
+                auto this_q = q_data + iq*qnb2;
+                auto this_w = (const float *)((const char *)w->data + w->nb[1]*iq);
+                DataInfo info{kq_th, this_q, (size_t)n_this_thread, (size_t)row_size_q, 0, 1, nullptr, 0};
+                mm.mul_mat_NxM(k->ne[0], (const char *)k->data + first*k->nb[1], k->nb[1], info, n_this_thread, q->ne[1]);
+                auto sc = row_score(iq) + first;
+                if (!c) {
+                    iqk_indexer_mask_row(m, iq, first, n_this_thread, sc);
+                } else {
+                    for (int j = 0; j < n_this_thread; ++j) sc[j] = 0.0f;
+                }
+                auto kq_i = kq_th;
+                for (int i = 0; i < int(q->ne[1]); ++i) {
+                    float wi = this_w[i];
+                    for (int j = 0; j < n_this_thread; ++j) {
+                        float relu = kq_i[j] > 0.0f ? kq_i[j] : 0.0f;
+                        sc[j] += wi * relu;
+                    }
+                    kq_i += n_this_thread;
+                }
+            }
+        }
+        barrier(barrier_data);
+        if (ith < nrows) {
+            auto sc    = row_score(ith);
+            auto sc_c  = c ? sc + k->ne[1] : sc;
+            auto srt   = (int32_t *)(sc + k->ne[1] + (c ? n_kv : 0));
+            auto i_inf = srt + n_kv;
+            auto i_aux = i_inf + n_kv;
+            auto cnt   = i_aux + n_kv;
+            if (c) {
+                iqk_indexer_mask_row(m, ith, 0, n_kv, sc_c);
+                auto idx = (const int32_t *)c->data;
+                for (int j = 0; j < n_kv; ++j) sc_c[j] += sc[idx[j]];
+            }
+            iqk_bucket_topk(n_kv, n_top_k, sc_c, srt, i_inf, k_n_bucket, cnt, i_aux);
+            std::memcpy((char *)dst->data + dst->nb[1]*ith, srt, n_top_k*sizeof(int32_t));
+        }
+        return true;
+    }
     for (int iq = 0; iq < q->ne[2]; ++iq) {
         if (n_this_thread > 0) {
             auto this_q = q_data + iq*qnb2;
