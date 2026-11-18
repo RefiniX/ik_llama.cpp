@@ -8,6 +8,9 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
+#include <memory>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 using json = nlohmann::ordered_json;
@@ -377,6 +380,20 @@ struct server_task_result_decision : server_task_result {
 // using shared_ptr for polymorphism of server_task_result
 using server_task_result_ptr = std::unique_ptr<server_task_result>;
 
+// An allocator that leaves new elements uninitialized: a checkpoint buffer is overwritten whole by
+// llama_state_seq_get_data right away, and zero-filling 100+ MiB first took about as long as the save itself.
+template <typename T>
+struct server_default_init_allocator : std::allocator<T> {
+    template <typename U> struct rebind { using other = server_default_init_allocator<U>; };
+    using std::allocator<T>::allocator;
+    template <typename U> void construct(U * p) noexcept(std::is_nothrow_default_constructible<U>::value) {
+        ::new (static_cast<void *>(p)) U;
+    }
+    template <typename U, typename... Args> void construct(U * p, Args &&... args) {
+        ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...);
+    }
+};
+
 struct server_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
@@ -386,7 +403,7 @@ struct server_prompt_checkpoint {
     // the checkpoint taken at the end of the prompt; kept while another entry can be evicted instead
     bool prompt_end = false;
 
-    std::vector<uint8_t> data;
+    std::vector<uint8_t, server_default_init_allocator<uint8_t>> data;
 
     // disk-spill location when data was offloaded (empty = resident / no spill)
     std::string spill_path;

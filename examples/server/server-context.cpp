@@ -4147,6 +4147,8 @@ bool server_context::create_checkpoint(server_slot & slot, bool prompt_end) {
                 ckpt.prompt_end = false;
             }
         }
+        // every checkpoint of a context has the same size: the buffer of an evicted one is reused as is
+        decltype(server_prompt_checkpoint::data) reuse;
         while (slot.server_cached_prompt.checkpoints.size() >= (size_t)params_base.ctx_checkpoints_n) {
             // make room for the new checkpoint, if needed
             auto it = slot.server_cached_prompt.checkpoints.begin();
@@ -4158,10 +4160,14 @@ bool server_context::create_checkpoint(server_slot & slot, bool prompt_end) {
             const auto & cur = *it;
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024);
+            if (reuse.empty()) {
+                reuse = std::move(it->data);
+            }
             drop_checkpoint_entry(slot.server_cached_prompt.checkpoints, it);
         }
 
         auto & cur = slot.server_cached_prompt.checkpoints.emplace_back();
+        cur.data = std::move(reuse);
         server_prompt_checkpoint_update(cur, ctx, slot.id, slot.cache_tokens.n_tokens(), pos_min, pos_max);
         cur.prompt_end = prompt_end;
         slot.checkpoint_pos = pos_max;
