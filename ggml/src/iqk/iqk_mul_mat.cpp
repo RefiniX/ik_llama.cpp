@@ -1016,9 +1016,13 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     }
     auto num_rows = MulMat::num_rows(ggml_type(typeA));
     GGML_ASSERT(Nx%num_rows == 0);
-    auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-    auto first_x = ith*nrc_x;
-    if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+    // Units [nunit*ith/nth, nunit*(ith+1)/nth): every thread gets the floor or the ceiling of the average. The ceil
+    // split (ceil(nunit/nth) per thread) left threads idle -- 80 units on 32 threads: 27 threads with 3, five with
+    // none, all of them on the second NUMA node -- and did not match the --numa-mirror rows expert placement.
+    const long nunit = Nx/num_rows;
+    long first_x = nunit*ith/nth;
+    long nrc_x   = nunit*(ith + 1)/nth - first_x;
+    if (nrc_x <= 0) return true;
     first_x *= num_rows;
     nrc_x *= num_rows;
     DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float),
@@ -1398,6 +1402,13 @@ void MulMat::silu(int n, const float * x, float * y) {
     int i = 0;
 #if defined __AVX512F__ && defined __AVX512DQ__
     for (; i + 15 < n; i += 16) _mm512_storeu_ps(y + i, v_silu(_mm512_loadu_ps(x + i)));
+    if (i < n) {
+        // masked tail instead of the AVX2 / scalar versions, whose results differ in the last bits: an element now gets
+        // the same value wherever the row split between threads puts it
+        const __mmask16 m = (__mmask16)((1u << (n - i)) - 1);
+        _mm512_mask_storeu_ps(y + i, m, v_silu(_mm512_maskz_loadu_ps(m, x + i)));
+        return;
+    }
 #endif
 #if defined __AVX2__ && defined __FMA__
     for (; i + 7 < n; i += 8) _mm256_storeu_ps(y + i, v_silu(_mm256_loadu_ps(x + i)));
