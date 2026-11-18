@@ -706,6 +706,12 @@ void ggml_fp8_e4m3_to_bf16_row(const ggml_fp8_e4m3_t * x, ggml_bf16_t * y, int64
 static void ggml_vec_dot_f8_e4m3(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc);
 static void ggml_vec_dot_f8_e4m3_ks(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc);
 
+#if defined(_MSC_VER)
+#define GGML_CACHE_ALIGN __declspec(align(CACHE_LINE_SIZE))
+#else
+#define GGML_CACHE_ALIGN __attribute__((aligned(CACHE_LINE_SIZE)))
+#endif
+
 static void ggml_vec_dot_f32(int n, float * restrict s, size_t bs, const float * restrict x, size_t bx, const float * restrict y, size_t by, int nrc);
 static void ggml_vec_dot_f16(int n, float * restrict s, size_t bs, ggml_fp16_t * restrict x, size_t bx, ggml_fp16_t * restrict y, size_t by, int nrc);
 static void ggml_vec_dot_bf16(int n, float * restrict s, size_t bs, const ggml_bf16_t * restrict x, size_t bx, const ggml_bf16_t * restrict y, size_t by, int nrc);
@@ -3282,14 +3288,15 @@ struct ggml_compute_state_shared {
     int n_threads;
     int n_batch;
 
-    // synchronization primitives
-    atomic_int n_barrier;
-    atomic_int n_barrier_passed;
+    // synchronization primitives, each on its own cache line: every thread writes them, and sharing a line with
+    // the read-mostly fields above makes all threads re-fetch it (same as mainline #9598)
+    atomic_int GGML_CACHE_ALIGN n_barrier;
+    atomic_int GGML_CACHE_ALIGN n_barrier_passed;
 
     ggml_abort_callback abort_callback; // abort ggml_graph_compute when true
     void * abort_callback_data;
 
-    atomic_int current_chunk; // currently processing chunk during mul_mat, shared between all the threads
+    atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during mul_mat, shared between all the threads
 
     enum ggml_status ec;
 };
