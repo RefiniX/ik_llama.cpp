@@ -20416,6 +20416,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     // so GGML_TENSOR_BINARY_OP_LOCALS works
 
     // compute each matrix multiplication in sequence
+    int n_active_seen = 0;
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -20445,12 +20446,21 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         const int64_t nr0 = src0_2 ? ne01 : ne01/2; // src0 rows
         const int64_t nr1 = cne1; // src1 rows
 
+        // Rotate the thread order inside each NUMA node block from one active expert to the next. There is no barrier
+        // between experts, and with 80 units on 32 threads half of the threads get one unit more than the others;
+        // rotating makes that a different half each time, so over the active experts every thread does about the
+        // average. The node blocks (and so the --numa-mirror rows placement) are unchanged.
+        const int nn = ggml_numa_mirror_active() ? ggml_numa_node_count() : 1;
+        const int kn = (int)(((int64_t)ith*nn)/nth);
+        const int f0 = (kn*nth + nn - 1)/nn, f1 = ((kn + 1)*nth + nn - 1)/nn;
+        const int ith_e = f0 + (ith - f0 + n_active_seen) % (f1 - f0);
+        ++n_active_seen;
         if (!iqk_moe_fused_up_gate(nr0, nr1, ne00, ne11, dst->op_params[0],
                             type, src0_1_cur, src0_2_cur, nb01,
                             vec_dot_type, (const char *)wdata, row_size,
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
-                            matrix_rows + cur_a*ne12, limit, situ_beta, situ_beta_linear, ith, nth)) GGML_ABORT("fatal error");
+                            matrix_rows + cur_a*ne12, limit, situ_beta, situ_beta_linear, ith_e, nth)) GGML_ABORT("fatal error");
 
     }
 #endif

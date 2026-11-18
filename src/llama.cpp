@@ -9728,7 +9728,8 @@ static void llama_mirror_model_weights_dense(const llama_model & model) {
 // --numa-mirror rows (or shard = dense,rows): keep the single copy of the routed experts, but place
 // each expert's rows on the node whose threads compute them. With mirroring, thread ith runs on node (ith*n_nodes)/nth,
 // and the MoE kernels give every thread a contiguous block of row units of each active expert: the fused up/gate kernel
-// units [nunit*ith/nth, nunit*(ith+1)/nth) (split_units_and_columns without y split), the mul_mat_id kernel (down)
+// units [nunit*ith/nth, nunit*(ith+1)/nth) (both the direct and the dequantizing path; the thread order is rotated inside
+// each node block per expert, which keeps the node ranges), the mul_mat_id kernel (down)
 // [ith*ceil(nunit/nth), (ith+1)*ceil(nunit/nth)). Binding those ranges to the thread's node turns the expert reads of
 // token generation local. Placement only: computation is unchanged; a wrong guess only costs speed. Assumes -t == -tb.
 static void llama_numa_place_expert_rows(const llama_model & model, int nth) {
