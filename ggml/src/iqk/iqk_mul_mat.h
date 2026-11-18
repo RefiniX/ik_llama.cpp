@@ -44,6 +44,7 @@ IQK_API void iqk_vec_dot_f8_e4m3_ks(int n, float * s, size_t bs, const void * x,
 IQK_API void iqk_vec_dot_f8_e4m3_b128(int n, float * s, size_t bs, const void * x, size_t bx,
         const void * y, size_t by, int nrc);
 
+IQK_API int iqk_num_rows(int type);
 
 struct ggml_tensor;
 

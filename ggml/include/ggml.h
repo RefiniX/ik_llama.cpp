@@ -1004,6 +1004,10 @@ extern "C" {
     GGML_API void     ggml_numa_free(void * ptr, size_t size);
     // best-effort migrate an already-populated range onto a node (mbind + MPOL_MF_MOVE)
     GGML_API void     ggml_numa_bind(void * ptr, size_t size, int node);
+    // rows per work unit of the CPU matmul kernels for a weight type (row-interleaved repacked types: 4, 8, 16; else 1)
+    GGML_API int      ggml_cpu_mul_mat_rows_per_unit(enum ggml_type type);
+    // count the pages of [ptr, ptr + size) resident on each NUMA node (counts[GGML_NUMA_MAX_NODES]); returns pages queried
+    GGML_API int      ggml_numa_query_pages(const void * ptr, size_t size, int * counts);
     // attach/detach per-node copies to a tensor. node_data must have ggml_numa_node_count() entries.
     GGML_API void     ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * node_data);
     GGML_API void     ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor);

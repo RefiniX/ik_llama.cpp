@@ -5572,6 +5572,38 @@ void ggml_numa_bind(void * ptr, size_t size, int node) {
 #endif
 }
 
+int ggml_cpu_mul_mat_rows_per_unit(enum ggml_type type) {
+#if GGML_USE_IQK_MULMAT
+    return iqk_num_rows((int) type);
+#else
+    UNUSED(type);
+    return 1;
+#endif
+}
+
+int ggml_numa_query_pages(const void * ptr, size_t size, int * counts) {
+    for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) counts[n] = 0;
+#if defined(__gnu_linux__) && defined(SYS_move_pages)
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+    const uintptr_t b = ((uintptr_t) ptr + pg - 1) & ~((uintptr_t) pg - 1), e = ((uintptr_t) ptr + size) & ~((uintptr_t) pg - 1);
+    if (e <= b) return 0;
+    const unsigned long n = (e - b) / pg;
+    void ** pages = (void **) malloc(n * sizeof(void *));
+    int * status = (int *) malloc(n * sizeof(int));
+    for (unsigned long i = 0; i < n; ++i) pages[i] = (void *) (b + i * pg);
+    int q = 0;
+    if (syscall(SYS_move_pages, 0, n, pages, NULL, status, 0) == 0) {
+        for (unsigned long i = 0; i < n; ++i) if (status[i] >= 0 && status[i] < GGML_NUMA_MAX_NODES) { counts[status[i]]++; q++; }
+    }
+    free(pages); free(status);
+    return q;
+#else
+    UNUSED(ptr); UNUSED(size);
+    return 0;
+#endif
+}
+
 // Configure the hierarchical barrier for the given thread count. Called single-threaded from
 // ggml_graph_compute before workers start. Allocates the node-local counter lines once.
 // Activates only when NUMA mirroring is on (threads are pinned per node, matching the block split
