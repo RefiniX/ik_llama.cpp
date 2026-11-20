@@ -1326,10 +1326,77 @@ static void mul_mat_q2_0_r8_q8_2(int n, const void * vx, size_t bx, const DataIn
 }
 
 #ifdef HAVE_FANCY_SIMD
+// Matrix x vector: two groups of 8 interleaved rows per 512-bit register, each half doing exactly what
+// mul_mat_q4_0_r8_q8_2_avx2<1> does, so the results are the same; an odd last group is paired with itself.
+static void mul_mat_q4_0_r8_q8_2_avx512_1(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    GGML_ASSERT(nrc_x%8 == 0);
+    Q8<1, block_q8_2_x4> q8(info);
+    auto m4 = _mm512_set1_epi8(0xf);
+    int nb = n / QK4_NL;
+    __m512i v[8];
+    auto prepare = [&v, &m4] (const uint8_t * qa, const uint8_t * qb) {
+        for (int j = 0; j < 4; ++j) {
+            auto bits = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)qa+j)), _mm256_loadu_si256((const __m256i *)qb+j), 1);
+            v[j+0] = _mm512_and_si512(bits, m4);
+            v[j+4] = _mm512_and_si512(_mm512_srli_epi16(bits, 4), m4);
+        }
+    };
+    auto accum = [&v] (const int8_t * qs) {
+        auto yl = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*)qs+0));
+        auto yh = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*)qs+1));
+        auto sumi = _mm512_setzero_si512();
+        sumi = _mm512_dpbusd_epi32(sumi, v[0], _mm512_shuffle_epi32(yl, _MM_PERM_ENUM(0x00)));
+        sumi = _mm512_dpbusd_epi32(sumi, v[1], _mm512_shuffle_epi32(yl, _MM_PERM_ENUM(0x55)));
+        sumi = _mm512_dpbusd_epi32(sumi, v[2], _mm512_shuffle_epi32(yl, _MM_PERM_ENUM(0xaa)));
+        sumi = _mm512_dpbusd_epi32(sumi, v[3], _mm512_shuffle_epi32(yl, _MM_PERM_ENUM(0xff)));
+        sumi = _mm512_dpbusd_epi32(sumi, v[4], _mm512_shuffle_epi32(yh, _MM_PERM_ENUM(0x00)));
+        sumi = _mm512_dpbusd_epi32(sumi, v[5], _mm512_shuffle_epi32(yh, _MM_PERM_ENUM(0x55)));
+        sumi = _mm512_dpbusd_epi32(sumi, v[6], _mm512_shuffle_epi32(yh, _MM_PERM_ENUM(0xaa)));
+        sumi = _mm512_dpbusd_epi32(sumi, v[7], _mm512_shuffle_epi32(yh, _MM_PERM_ENUM(0xff)));
+        return sumi;
+    };
+    auto load_scales = [] (const block_iq4_nl_r8 * xa, const block_iq4_nl_r8 * xb) {
+        return _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)xa->d))),
+                                                         _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)xb->d)), 1);
+    };
+    union { __m256 vec; float val[8]; } helper;
+    for (int ix = 0; ix < nrc_x; ix += 16) {
+        const bool pair = ix + 8 < nrc_x;
+        const block_iq4_nl_r8 * xa = (const block_iq4_nl_r8 *)((const char *)vx + ix*bx);
+        const block_iq4_nl_r8 * xb = pair ? (const block_iq4_nl_r8 *)((const char *)vx + (ix+8)*bx) : xa;
+        auto acc1 = _mm512_setzero_ps();
+        auto acc2 = _mm512_setzero_ps();
+        for (int ib4 = 0; ib4 < nb/4; ++ib4) {
+            helper.vec = convert_scales((const uint16_t *)q8.y[0][ib4].d);
+            for (int k = 0; k < 4; ++k) {
+                auto scales = load_scales(xa + 4*ib4+k, xb + 4*ib4+k);
+                prepare(xa[4*ib4+k].qs, xb[4*ib4+k].qs);
+                auto sumi = accum(q8.y[0][ib4].qs+32*k);
+                auto d4d8 = _mm512_mul_ps(scales, _mm512_set1_ps(helper.val[k]));
+                acc1 = _mm512_fmadd_ps(d4d8, _mm512_cvtepi32_ps(sumi), acc1);
+                acc2 = _mm512_fmadd_ps(scales, _mm512_set1_ps(helper.val[k+4]), acc2);
+            }
+        }
+        for (int ib = 4*(nb/4); ib < nb; ++ib) {
+            auto qy = (const block_q8_2 *)q8.y[0];
+            auto scales = load_scales(xa + ib, xb + ib);
+            prepare(xa[ib].qs, xb[ib].qs);
+            auto sumi = accum(qy[ib].qs);
+            auto [d8, m8] = ScaleHelperQ8_2::prepare1(qy + ib);
+            auto d4d8 = _mm512_mul_ps(scales, _mm512_set1_ps(d8));
+            acc1 = _mm512_fmadd_ps(d4d8, _mm512_cvtepi32_ps(sumi), acc1);
+            acc2 = _mm512_fmadd_ps(scales, _mm512_set1_ps(m8), acc2);
+        }
+        acc1 = _mm512_fmadd_ps(acc2, _mm512_set1_ps(-8.f), acc1);
+        info.store(ix, 0, _mm512_castps512_ps256(acc1));
+        if (pair) info.store(ix+8, 0, _mm512_extractf32x8_ps(acc1, 1));
+    }
+}
+
 template <int nrc_y>
 static void mul_mat_q4_0_r8_q8_2(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     if constexpr (nrc_y == 1) {
-        mul_mat_q4_0_r8_q8_2_avx2<1>(n, vx, bx, info, nrc_x);
+        mul_mat_q4_0_r8_q8_2_avx512_1(n, vx, bx, info, nrc_x);
         return;
     }
     GGML_ASSERT(nrc_x%16 == 0);
@@ -1569,10 +1636,68 @@ static void mul_mat_mxfp4_r8_q8_2_avx2(int n, const void * vx, size_t bx, const 
 }
 
 #ifdef HAVE_FANCY_SIMD
+// Matrix x vector: two groups of 8 interleaved rows per 512-bit register, each half doing exactly what
+// mul_mat_mxfp4_r8_q8_2_avx2<1> does, so the results are the same; an odd last group is paired with itself.
+static void mul_mat_mxfp4_r8_q8_2_avx512_1(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    GGML_ASSERT(nrc_x%8 == 0);
+    Q8<1, block_q8_2_x4> q8(info);
+    auto m4 = _mm512_set1_epi8(0xf);
+    int nb = n / QK_MXFP4;
+    auto table = _mm512_add_epi8(_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)kvalues_mxfp4)), _mm512_set1_epi8(12));
+    __m512i v[8];
+    auto prepare = [&v, &m4, &table] (const uint8_t * qa, const uint8_t * qb) {
+        for (int j = 0; j < 4; ++j) {
+            auto bits = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)qa+j)), _mm256_loadu_si256((const __m256i *)qb+j), 1);
+            v[j+0] = _mm512_shuffle_epi8(table, _mm512_and_si512(bits, m4));
+            v[j+4] = _mm512_shuffle_epi8(table, _mm512_and_si512(_mm512_srli_epi16(bits, 4), m4));
+        }
+    };
+    auto accum = [&v] (const int8_t * qs) {
+        auto sumi = _mm512_setzero_si512();
+        for (int j = 0; j < 8; ++j) sumi = _mm512_dpbusd_epi32(sumi, v[j], _mm512_set1_epi32(*((const int32_t *)(qs + 4*j))));
+        return sumi;
+    };
+    auto load_scales = [] (const block_mxfp4_r8 * xa, const block_mxfp4_r8 * xb) {
+        return _mm512_insertf32x8(_mm512_castps256_ps512(convert_mxfp4_scales(xa->e)), convert_mxfp4_scales(xb->e), 1);
+    };
+    union { __m256 vec; float val[8]; } helper;
+    for (int ix = 0; ix < nrc_x; ix += 16) {
+        const bool pair = ix + 8 < nrc_x;
+        const block_mxfp4_r8 * xa = (const block_mxfp4_r8 *)((const char *)vx + ix*bx);
+        const block_mxfp4_r8 * xb = pair ? (const block_mxfp4_r8 *)((const char *)vx + (ix+8)*bx) : xa;
+        auto acc1 = _mm512_setzero_ps();
+        auto acc2 = _mm512_setzero_ps();
+        for (int ib4 = 0; ib4 < nb/4; ++ib4) {
+            helper.vec = convert_scales((const uint16_t *)q8.y[0][ib4].d);
+            for (int k = 0; k < 4; ++k) {
+                auto scales = load_scales(xa + 4*ib4+k, xb + 4*ib4+k);
+                prepare(xa[4*ib4+k].qs, xb[4*ib4+k].qs);
+                auto sumi = accum(q8.y[0][ib4].qs+32*k);
+                auto d4d8 = _mm512_mul_ps(scales, _mm512_set1_ps(helper.val[k]));
+                acc1 = _mm512_fmadd_ps(d4d8, _mm512_cvtepi32_ps(sumi), acc1);
+                acc2 = _mm512_fmadd_ps(scales, _mm512_set1_ps(helper.val[k+4]), acc2);
+            }
+        }
+        for (int ib = 4*(nb/4); ib < nb; ++ib) {
+            auto qy = (const block_q8_2 *)q8.y[0];
+            auto scales = load_scales(xa + ib, xb + ib);
+            prepare(xa[ib].qs, xb[ib].qs);
+            auto sumi = accum(qy[ib].qs);
+            auto [d8, m8] = ScaleHelperQ8_2::prepare1(qy + ib);
+            auto d4d8 = _mm512_mul_ps(scales, _mm512_set1_ps(d8));
+            acc1 = _mm512_fmadd_ps(d4d8, _mm512_cvtepi32_ps(sumi), acc1);
+            acc2 = _mm512_fmadd_ps(scales, _mm512_set1_ps(m8), acc2);
+        }
+        acc1 = _mm512_fmadd_ps(acc2, _mm512_set1_ps(-12.f), acc1);
+        info.store(ix, 0, _mm512_castps512_ps256(acc1));
+        if (pair) info.store(ix+8, 0, _mm512_extractf32x8_ps(acc1, 1));
+    }
+}
+
 template <int nrc_y>
 static void mul_mat_mxfp4_r8_q8_2(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     if constexpr (nrc_y == 1) {
-        mul_mat_mxfp4_r8_q8_2_avx2<1>(n, vx, bx, info, nrc_x);
+        mul_mat_mxfp4_r8_q8_2_avx512_1(n, vx, bx, info, nrc_x);
         return;
     }
     GGML_ASSERT(nrc_x%16 == 0);
@@ -2130,34 +2255,48 @@ static void mul_mat_q8_0_r8_q8_2(int n, const void * vx, size_t bx, const DataIn
     Q8<nrc_y, block_q8_2_x4> q8(info);
     int nb = n / QK8_0;
     if constexpr (nrc_y == 1) {
-        __m256 acc[2] = {};
-        __m256i qx[8];
+        // Two groups of 8 interleaved rows per 512-bit register; the float operations of each half are the ones the
+        // 256-bit version did for its 8 rows (integer sums do not depend on the order), so the results are the same.
+        __m512 acc[2] = {};
+        __m512i qx[8];
         float d8[8];
-        for (int ix = 0; ix < nrc_x; ix += 8) {
-            const block_q8_0_r8 * iq8 = (const block_q8_0_r8 *)((const char *)vx + ix*bx);
+        for (int ix = 0; ix < nrc_x; ix += 16) {
+            const block_q8_0_r8 * q8l = (const block_q8_0_r8 *)((const char *)vx + (ix+0)*bx);
+            const block_q8_0_r8 * q8h = (const block_q8_0_r8 *)((const char *)vx + (ix+8)*bx);
+            auto load = [&qx] (const block_q8_0_r8 * xl, const block_q8_0_r8 * xh) {
+                for (int j = 0; j < 8; ++j) {
+                    qx[j] = _mm512_inserti32x8(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)xl->qs+j)),
+                                                                      _mm256_loadu_si256((const __m256i *)xh->qs+j), 1);
+                    qx[j] = _mm512_add_epi8(qx[j], _mm512_set1_epi8(127));
+                }
+                return _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)xl->d))),
+                                                                 _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)xh->d)), 1);
+            };
             for (int ib4 = 0; ib4 < nb/4; ++ib4) {
                 _mm256_storeu_ps(d8, convert_scales((const uint16_t *)q8.y[0][ib4].d));
                 for (int k = 0; k < 4; ++k) {
-                    auto scales = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)iq8[4*ib4+k].d));
-                    auto sumi = q8_0_r8_dot_product((const uint8_t *)iq8[4*ib4+k].qs, q8.y[0][ib4].qs+32*k, qx);
-                    auto d4d8 = _mm256_mul_ps(scales, _mm256_set1_ps(d8[k]));
-                    acc[0] = _mm256_fmadd_ps(d4d8, _mm256_cvtepi32_ps(sumi), acc[0]);
-                    acc[1] = _mm256_fmadd_ps(scales, _mm256_set1_ps(d8[k+4]), acc[1]);
+                    auto scales = load(q8l + 4*ib4+k, q8h + 4*ib4+k);
+                    auto sumi = qx_r8_q8_dot_product(qx, q8.y[0][ib4].qs+32*k);
+                    auto d4d8 = _mm512_mul_ps(scales, _mm512_set1_ps(d8[k]));
+                    acc[0] = _mm512_fmadd_ps(d4d8, _mm512_cvtepi32_ps(sumi), acc[0]);
+                    acc[1] = _mm512_fmadd_ps(scales, _mm512_set1_ps(d8[k+4]), acc[1]);
                 }
             }
             if (4*(nb/4) < nb) {
                 auto qy = (const block_q8_2 *)q8.y[0];
                 for (int ib = 4*(nb/4); ib < nb; ++ib) {
-                    auto scales = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)iq8[ib].d));
-                    auto sumi = q8_0_r8_dot_product((const uint8_t *)iq8[ib].qs, qy[ib].qs, qx);
+                    auto scales = load(q8l + ib, q8h + ib);
+                    auto sumi = qx_r8_q8_dot_product(qx, qy[ib].qs);
                     auto [d8, m8] = ScaleHelperQ8_2::prepare1(qy + ib);
-                    auto d4d8 = _mm256_mul_ps(scales, _mm256_set1_ps(d8));
-                    acc[0] = _mm256_fmadd_ps(d4d8, _mm256_cvtepi32_ps(sumi), acc[0]);
-                    acc[1] = _mm256_fmadd_ps(scales, _mm256_set1_ps(m8), acc[1]);
+                    auto d4d8 = _mm512_mul_ps(scales, _mm512_set1_ps(d8));
+                    acc[0] = _mm512_fmadd_ps(d4d8, _mm512_cvtepi32_ps(sumi), acc[0]);
+                    acc[1] = _mm512_fmadd_ps(scales, _mm512_set1_ps(m8), acc[1]);
                 }
             }
-            info.store(ix, 0, _mm256_fmadd_ps(_mm256_set1_ps(-127.f), acc[1], acc[0]));
-            acc[0] = acc[1] = _mm256_setzero_ps();
+            auto sum = _mm512_fmadd_ps(_mm512_set1_ps(-127.f), acc[1], acc[0]);
+            info.store(ix+0, 0, _mm512_castps512_ps256(sum));
+            info.store(ix+8, 0, _mm512_extractf32x8_ps(sum, 1));
+            acc[0] = acc[1] = _mm512_setzero_ps();
         }
     } else {
         __m512  acc[2*nrc_y] = {};

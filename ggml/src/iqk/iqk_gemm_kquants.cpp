@@ -1852,6 +1852,220 @@ static void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataIn
     }
 }
 
+#ifdef HAVE_FANCY_SIMD
+// AVX-512 versions of the Q4_K_R4, Q5_K_R4 and Q6_K_R4 kernels: two groups of 4 interleaved rows per 512-bit register,
+// the lower 256 bits doing exactly what the 256-bit kernel does for rows ix..ix+3 and the upper 256 bits the same
+// for rows ix+4..ix+7, so every output is computed with the same operations in the same order as before.
+// An odd last group is paired with itself and only its lower half is stored.
+static inline __m512i zpair(__m256i a, __m256i b) { return _mm512_inserti64x4(_mm512_castsi256_si512(a), b, 1); }
+static inline __m512  zpair(__m256  a, __m256  b) { return _mm512_insertf32x8(_mm512_castps256_ps512(a), b, 1); }
+
+template <int nrc_y>
+inline void process_min_r4_b32_x2(int ibl, __m512 m4, __m256i mins_a, __m256i mins_b, const Q8<nrc_y, block_q8_K>& q8, __m512 * acc) {
+    __m256i ic[2][4];
+    for (int g = 0; g < 2; ++g) {
+        auto mins   = g == 0 ? mins_a : mins_b;
+        auto mins_l = _mm256_castsi256_si128(mins);
+        auto mins_h = _mm256_extracti128_si256(mins, 1);
+        auto aux1   = _mm_unpacklo_epi32(mins_l, mins_h);
+        auto aux2   = _mm_unpackhi_epi32(mins_l, mins_h);
+        ic[g][0] = _mm256_cvtepi8_epi32(aux1);
+        ic[g][1] = _mm256_cvtepi8_epi32(_mm_shuffle_epi32(aux1, 0xee));
+        ic[g][2] = _mm256_cvtepi8_epi32(aux2);
+        ic[g][3] = _mm256_cvtepi8_epi32(_mm_shuffle_epi32(aux2, 0xee));
+    }
+    auto ic1 = zpair(ic[0][0], ic[1][0]), ic2 = zpair(ic[0][1], ic[1][1]), ic3 = zpair(ic[0][2], ic[1][2]), ic4 = zpair(ic[0][3], ic[1][3]);
+    if constexpr (nrc_y == 1) {
+        auto bs = _mm512_broadcast_f32x8(_mm256_loadu_ps((const float *)q8.y[0][ibl].bsums));
+        auto sumf = _mm512_mul_ps(_mm512_cvtepi32_ps(ic1), _mm512_shuffle_ps(bs, bs, 0x00));
+        sumf = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ic2), _mm512_shuffle_ps(bs, bs, 0x55), sumf);
+        sumf = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ic3), _mm512_shuffle_ps(bs, bs, 0xaa), sumf);
+        sumf = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ic4), _mm512_shuffle_ps(bs, bs, 0xff), sumf);
+        acc[0] = _mm512_fmadd_ps(m4, sumf, acc[0]);
+    } else {
+        auto c1 = _mm512_mul_ps(m4, _mm512_cvtepi32_ps(ic1));
+        auto c2 = _mm512_mul_ps(m4, _mm512_cvtepi32_ps(ic2));
+        auto c3 = _mm512_mul_ps(m4, _mm512_cvtepi32_ps(ic3));
+        auto c4 = _mm512_mul_ps(m4, _mm512_cvtepi32_ps(ic4));
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            auto bs = _mm512_broadcast_f32x8(_mm256_loadu_ps((const float *)q8.y[iy][ibl].bsums));
+            acc[iy] = _mm512_fmadd_ps(c1, _mm512_shuffle_ps(bs, bs, 0x00), acc[iy]);
+            acc[iy] = _mm512_fmadd_ps(c2, _mm512_shuffle_ps(bs, bs, 0x55), acc[iy]);
+            acc[iy] = _mm512_fmadd_ps(c3, _mm512_shuffle_ps(bs, bs, 0xaa), acc[iy]);
+            acc[iy] = _mm512_fmadd_ps(c4, _mm512_shuffle_ps(bs, bs, 0xff), acc[iy]);
+        }
+    }
+}
+
+template <int nrc_y>
+inline void store_r4_x2(const DataInfo& info, int ix, bool pair, __m512 * acc) {
+    for (int iy = 0; iy < nrc_y; ++iy) {
+        info.store(ix+0, iy, _mm_add_ps(_mm512_extractf32x4_ps(acc[iy], 0), _mm512_extractf32x4_ps(acc[iy], 1)));
+        if (pair) info.store(ix+4, iy, _mm_add_ps(_mm512_extractf32x4_ps(acc[iy], 2), _mm512_extractf32x4_ps(acc[iy], 3)));
+        acc[iy] = _mm512_setzero_ps();
+    }
+}
+
+// Q4_K_R4 and Q5_K_R4 share everything but the 5th bit
+template <int nrc_y, bool is_q5>
+static void mul_mat_q45_k_r4_q8_k_avx512(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    GGML_ASSERT(nrc_x%4 == 0);
+    using block_t = std::conditional_t<is_q5, block_q5_k_r4, block_q4_k_r4>;
+    Q8<nrc_y, block_q8_K> q8(info);
+    auto mf  = _mm256_set1_epi8(0xf);
+    auto m30 = _mm256_set1_epi8(0x30);
+    auto mfz = _mm512_set1_epi8(0xf);
+    auto m10 = _mm512_set1_epi8(0x10);
+    int nbl = n / QK_K;
+    union { __m256i vec; uint32_t val[8]; } hd[2];
+    __m512  acc[nrc_y] = {};
+    __m512i isum[nrc_y] = {};
+    __m512i qx[4];
+    for (int ix = 0; ix < nrc_x; ix += 8) {
+        const bool pair = ix + 4 < nrc_x;
+        const block_t * xa = (const block_t *)((const char *)vx + (ix+0)*bx);
+        const block_t * xb = pair ? (const block_t *)((const char *)vx + (ix+4)*bx) : xa;
+        for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            __m256 d4g[2], m4g[2];
+            __m256i mins[2];
+            for (int g = 0; g < 2; ++g) {
+                const block_t * x = g == 0 ? xa : xb;
+                auto dl = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)x[ibl].d));
+                d4g[g] = _mm256_set_m128(_mm256_castps256_ps128(dl), _mm256_castps256_ps128(dl));
+                m4g[g] = _mm256_mul_ps(_mm256_set1_ps(-1.0f), _mm256_set_m128(_mm256_extractf128_ps(dl, 1), _mm256_extractf128_ps(dl, 1)));
+                auto lbits = _mm256_loadu_si256((const __m256i *)x[ibl].scales_l);
+                auto hbits128 = _mm_loadu_si128((const __m128i *)x[ibl].scales_h);
+                auto hbits = MM256_SET_M128I(hbits128, _mm_slli_epi16(hbits128, 4));
+                hd[g].vec = _mm256_or_si256(_mm256_and_si256(lbits, mf), _mm256_and_si256(hbits, m30));
+                mins[g] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(lbits, 4), mf), _mm256_and_si256(_mm256_srli_epi16(hbits, 2), m30));
+            }
+            auto d4 = zpair(d4g[0], d4g[1]);
+            process_min_r4_b32_x2(ibl, zpair(m4g[0], m4g[1]), mins[0], mins[1], q8, acc);
+            for (int ib = 0; ib < QK_K/32; ++ib) {
+                auto scales_d = _mm512_cvtepi8_epi32(_mm_set_epi32(hd[1].val[ib], hd[1].val[ib], hd[0].val[ib], hd[0].val[ib]));
+                auto bits1 = zpair(_mm256_loadu_si256((const __m256i *)xa[ibl].qs+2*ib+0), _mm256_loadu_si256((const __m256i *)xb[ibl].qs+2*ib+0));
+                auto bits2 = zpair(_mm256_loadu_si256((const __m256i *)xa[ibl].qs+2*ib+1), _mm256_loadu_si256((const __m256i *)xb[ibl].qs+2*ib+1));
+                if constexpr (is_q5) {
+                    __m256i hg[2];
+                    for (int g = 0; g < 2; ++g) {
+                        auto hbits128 = _mm_loadu_si128((const __m128i*)(g == 0 ? xa : xb)[ibl].qh + ib);
+                        hg[g] = MM256_SET_M128I(hbits128, _mm_slli_epi16(hbits128, 4));
+                    }
+                    auto hbits = zpair(hg[0], hg[1]);
+                    qx[0] = _mm512_or_si512(_mm512_and_si512(bits1, mfz), _mm512_and_si512(m10, hbits));
+                    qx[1] = _mm512_or_si512(_mm512_and_si512(bits2, mfz), _mm512_and_si512(m10, _mm512_srli_epi16(hbits, 2)));
+                    qx[2] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(bits1, 4), mfz), _mm512_and_si512(m10, _mm512_srli_epi16(hbits, 1)));
+                    qx[3] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(bits2, 4), mfz), _mm512_and_si512(m10, _mm512_srli_epi16(hbits, 3)));
+                } else {
+                    qx[0] = _mm512_and_si512(bits1, mfz);
+                    qx[1] = _mm512_and_si512(bits2, mfz);
+                    qx[2] = _mm512_and_si512(_mm512_srli_epi16(bits1, 4), mfz);
+                    qx[3] = _mm512_and_si512(_mm512_srli_epi16(bits2, 4), mfz);
+                }
+                for (int iy = 0; iy < nrc_y; ++iy) {
+                    auto y = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)q8.y[iy][ibl].qs+ib));
+                    auto sumi = _mm512_setzero_si512();
+                    sumi = _mm512_dpbusd_epi32(sumi, qx[0], _mm512_shuffle_epi32(y, _MM_PERM_ENUM(0x00)));
+                    sumi = _mm512_dpbusd_epi32(sumi, qx[1], _mm512_shuffle_epi32(y, _MM_PERM_ENUM(0x55)));
+                    sumi = _mm512_dpbusd_epi32(sumi, qx[2], _mm512_shuffle_epi32(y, _MM_PERM_ENUM(0xaa)));
+                    sumi = _mm512_dpbusd_epi32(sumi, qx[3], _mm512_shuffle_epi32(y, _MM_PERM_ENUM(0xff)));
+                    isum[iy] = _mm512_add_epi32(isum[iy], _mm512_mullo_epi32(scales_d, sumi));
+                }
+            }
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                acc[iy] = _mm512_fmadd_ps(_mm512_mul_ps(d4, _mm512_set1_ps(q8.scale(iy, ibl))), _mm512_cvtepi32_ps(isum[iy]), acc[iy]);
+                isum[iy] = _mm512_setzero_si512();
+            }
+        }
+        store_r4_x2<nrc_y>(info, ix, pair, acc);
+    }
+}
+template <int nrc_y> static void mul_mat_q4_k_r4_q8_k_avx512(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    mul_mat_q45_k_r4_q8_k_avx512<nrc_y, false>(n, vx, bx, info, nrc_x);
+}
+template <int nrc_y> static void mul_mat_q5_k_r4_q8_k_avx512(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    mul_mat_q45_k_r4_q8_k_avx512<nrc_y, true>(n, vx, bx, info, nrc_x);
+}
+
+template <int nrc_y>
+static void mul_mat_q6_k_r4_q8_k_avx512(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    GGML_ASSERT(nrc_x%4 == 0);
+    Q8<nrc_y, block_q8_K> q8(info);
+    auto m4 = _mm512_set1_epi8(0xf);
+    auto m3 = _mm512_set1_epi8(0x30);
+    static const uint8_t k_shuff[32] = {0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15, 0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15};
+    auto shuff = _mm256_loadu_si256((const __m256i *)k_shuff);
+    int nbl = n / QK_K;
+    __m512  acc[nrc_y] = {};
+    __m512i isum[nrc_y];
+    __m512i qx[4];
+    for (int ix = 0; ix < nrc_x; ix += 8) {
+        const bool pair = ix + 4 < nrc_x;
+        const block_q6_k_r4 * xa = (const block_q6_k_r4 *)((const char *)vx + (ix+0)*bx);
+        const block_q6_k_r4 * xb = pair ? (const block_q6_k_r4 *)((const char *)vx + (ix+4)*bx) : xa;
+        for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            auto dla = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)xa[ibl].d));
+            auto dlb = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)xb[ibl].d));
+            auto d4 = zpair(_mm256_set_m128(dla, dla), _mm256_set_m128(dlb, dlb));
+            {
+                __m256i sg[2][4];
+                for (int g = 0; g < 2; ++g) {
+                    const block_q6_k_r4 * x = g == 0 ? xa : xb;
+                    auto t1 = _mm256_shuffle_epi8(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)x[ibl].scales+0)), shuff);
+                    auto t2 = _mm256_shuffle_epi8(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)x[ibl].scales+1)), shuff);
+                    auto t3 = _mm256_shuffle_epi8(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)x[ibl].scales+2)), shuff);
+                    auto t4 = _mm256_shuffle_epi8(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)x[ibl].scales+3)), shuff);
+                    sg[g][0] = MM256_SET_M128I(_mm256_extracti128_si256(t3, 0), _mm256_extracti128_si256(t1, 0));
+                    sg[g][1] = MM256_SET_M128I(_mm256_extracti128_si256(t3, 1), _mm256_extracti128_si256(t1, 1));
+                    sg[g][2] = MM256_SET_M128I(_mm256_extracti128_si256(t4, 0), _mm256_extracti128_si256(t2, 0));
+                    sg[g][3] = MM256_SET_M128I(_mm256_extracti128_si256(t4, 1), _mm256_extracti128_si256(t2, 1));
+                }
+                auto m32 = _mm512_set1_epi16(-32);
+                auto s1 = _mm512_mullo_epi16(zpair(sg[0][0], sg[1][0]), m32);
+                auto s2 = _mm512_mullo_epi16(zpair(sg[0][1], sg[1][1]), m32);
+                auto s3 = _mm512_mullo_epi16(zpair(sg[0][2], sg[1][2]), m32);
+                auto s4 = _mm512_mullo_epi16(zpair(sg[0][3], sg[1][3]), m32);
+                for (int iy = 0; iy < nrc_y; ++iy) {
+                    auto bsums = _mm512_broadcast_i64x4(q8.load_bsums(iy, ibl));
+                    auto sumi = _mm512_setzero_si512();
+                    sumi = _mm512_dpwssd_epi32(sumi, s1, _mm512_shuffle_epi32(bsums, _MM_PERM_ENUM(0x00)));
+                    sumi = _mm512_dpwssd_epi32(sumi, s2, _mm512_shuffle_epi32(bsums, _MM_PERM_ENUM(0x55)));
+                    sumi = _mm512_dpwssd_epi32(sumi, s3, _mm512_shuffle_epi32(bsums, _MM_PERM_ENUM(0xaa)));
+                    sumi = _mm512_dpwssd_epi32(sumi, s4, _mm512_shuffle_epi32(bsums, _MM_PERM_ENUM(0xff)));
+                    isum[iy] = sumi;
+                }
+            }
+            const uint64_t * sa = (const uint64_t *)xa[ibl].scales;
+            const uint64_t * sb = (const uint64_t *)xb[ibl].scales;
+            for (int ib = 0; ib < QK_K/32; ++ib) {
+                auto iscales = _mm512_cvtepi8_epi32(_mm_set_epi64x(sb[ib], sa[ib]));
+                auto lbits1 = zpair(_mm256_loadu_si256((const __m256i *)xa[ibl].ql+2*ib+0), _mm256_loadu_si256((const __m256i *)xb[ibl].ql+2*ib+0));
+                auto lbits2 = zpair(_mm256_loadu_si256((const __m256i *)xa[ibl].ql+2*ib+1), _mm256_loadu_si256((const __m256i *)xb[ibl].ql+2*ib+1));
+                auto hbits  = zpair(_mm256_loadu_si256((const __m256i *)xa[ibl].qh+ib),     _mm256_loadu_si256((const __m256i *)xb[ibl].qh+ib));
+                qx[0] = _mm512_or_si512(_mm512_and_si512(lbits1, m4), _mm512_and_si512(m3, _mm512_slli_epi16(hbits, 4)));
+                qx[1] = _mm512_or_si512(_mm512_and_si512(lbits2, m4), _mm512_and_si512(m3, hbits));
+                qx[2] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(lbits1, 4), m4), _mm512_and_si512(m3, _mm512_slli_epi16(hbits, 2)));
+                qx[3] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(lbits2, 4), m4), _mm512_and_si512(m3, _mm512_srli_epi16(hbits, 2)));
+                for (int iy = 0; iy < nrc_y; ++iy) {
+                    auto y = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)q8.y[iy][ibl].qs+ib));
+                    auto sumi = _mm512_setzero_si512();
+                    sumi = _mm512_dpbusd_epi32(sumi, qx[0], _mm512_shuffle_epi32(y, _MM_PERM_ENUM(0x00)));
+                    sumi = _mm512_dpbusd_epi32(sumi, qx[1], _mm512_shuffle_epi32(y, _MM_PERM_ENUM(0x55)));
+                    sumi = _mm512_dpbusd_epi32(sumi, qx[2], _mm512_shuffle_epi32(y, _MM_PERM_ENUM(0xaa)));
+                    sumi = _mm512_dpbusd_epi32(sumi, qx[3], _mm512_shuffle_epi32(y, _MM_PERM_ENUM(0xff)));
+                    isum[iy] = _mm512_add_epi32(isum[iy], _mm512_mullo_epi32(iscales, sumi));
+                }
+            }
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                auto d4y = _mm512_mul_ps(d4, _mm512_set1_ps(q8.scale(iy, ibl)));
+                acc[iy] = _mm512_fmadd_ps(d4y, _mm512_cvtepi32_ps(isum[iy]), acc[iy]);
+            }
+        }
+        store_r4_x2<nrc_y>(info, ix, pair, acc);
+    }
+}
+#endif
+
 template <typename Dequantizer> void set_functions(std::array<mul_mat_t, IQK_MAX_NY>& funcs) {
 #ifdef HAVE_FANCY_SIMD
     if constexpr (std::is_same_v<Dequantizer, DequantizerIQ4XS>) {
@@ -3296,13 +3510,25 @@ bool iqk_set_kernels_kquants([[maybe_unused]] int ne00, int typeA, int typeB, st
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q3_k_r4_q8_k, kernels)
             break;
         case GGML_TYPE_Q4_K_R4:
+#ifdef HAVE_FANCY_SIMD
+            IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q4_k_r4_q8_k_avx512, kernels)
+#else
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q4_k_r4_q8_k, kernels)
+#endif
             break;
         case GGML_TYPE_Q5_K_R4:
+#ifdef HAVE_FANCY_SIMD
+            IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q5_k_r4_q8_k_avx512, kernels)
+#else
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q5_k_r4_q8_k, kernels)
+#endif
             break;
         case GGML_TYPE_Q6_K_R4:
+#ifdef HAVE_FANCY_SIMD
+            IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q6_k_r4_q8_k_avx512, kernels)
+#else
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q6_k_r4_q8_k, kernels)
+#endif
             break;
         case GGML_TYPE_IQ4_XS_R8:
 #ifdef HAVE_FANCY_SIMD
