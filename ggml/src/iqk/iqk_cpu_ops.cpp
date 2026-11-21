@@ -441,13 +441,11 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
     GGML_ASSERT(src0->ne[3] == 1);
     GGML_ASSERT(src1->ne[0] == 1);
 
-    int nrows = dst->ne[1];
-    int npt   = (nrows + nth - 1)/nth;
-    int first = ith*npt;
-    int last  = std::min(nrows, first + npt);
+    int64_t first, last, c0, c1;
+    ggml_split_rows_cols(dst->ne[1], src0->ne[0], ith, nth, &first, &last, &c0, &c1);
 
     int ne01 = src0->ne[1];
-    int ne00 = src0->ne[0];
+    int ne00 = c1 - c0;
 
     auto src2 = dst->src[2];
     auto src3 = dst->src[3];
@@ -459,20 +457,20 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
         auto cids = (const char *)src3->data;
         auto scales = (const float *)src2->data;
         for (int ir = first; ir < last; ++ir) {
-            auto c0 = (const char *)src0->data + ir*src0->nb[2];
-            auto c1 = (const char *)src1->data + ir*src1->nb[2];
+            auto p0 = (const char *)src0->data + ir*src0->nb[2];
+            auto p1 = (const char *)src1->data + ir*src1->nb[2];
             auto cy = (      char *)dst->data + ir* dst->nb[1];
-            auto  y = (     float *)cy;
-            auto x0 = (const float *)c0;
-            auto x1 = (const float *)c1;
+            auto  y = (     float *)cy + c0;
+            auto x0 = (const float *)p0 + c0;
+            auto x1 = (const float *)p1;
             auto ids = (const int *)(cids + ir*src3->nb[1]);
             float s = scales[ids[0]] * x1[0];
             for (int k = 0; k < ne00; ++k) y[k] = x0[k] * s;
             for (int j = 1; j < ne01; ++j) {
-                c0 += src0->nb[1];
-                c1 += src1->nb[1];
-                x0 = (const float *)c0;
-                x1 = (const float *)c1;
+                p0 += src0->nb[1];
+                p1 += src1->nb[1];
+                x0 = (const float *)p0 + c0;
+                x1 = (const float *)p1;
                 s  = x1[0] * scales[ids[j]];
                 for (int k = 0; k < ne00; ++k) y[k] += x0[k] * s;
             }
@@ -483,18 +481,18 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
     }
 
     for (int ir = first; ir < last; ++ir) {
-        auto c0 = (const char *)src0->data + ir*src0->nb[2];
-        auto c1 = (const char *)src1->data + ir*src1->nb[2];
+        auto p0 = (const char *)src0->data + ir*src0->nb[2];
+        auto p1 = (const char *)src1->data + ir*src1->nb[2];
         auto cy = (      char *)dst->data + ir* dst->nb[1];
-        auto  y = (     float *)cy;
-        auto x0 = (const float *)c0;
-        auto x1 = (const float *)c1;
+        auto  y = (     float *)cy + c0;
+        auto x0 = (const float *)p0 + c0;
+        auto x1 = (const float *)p1;
         for (int k = 0; k < ne00; ++k) y[k] = x0[k] * x1[0];
         for (int j = 1; j < ne01; ++j) {
-            c0 += src0->nb[1];
-            c1 += src1->nb[1];
-            x0 = (const float *)c0;
-            x1 = (const float *)c1;
+            p0 += src0->nb[1];
+            p1 += src1->nb[1];
+            x0 = (const float *)p0 + c0;
+            x1 = (const float *)p1;
             for (int k = 0; k < ne00; ++k) y[k] += x0[k] * x1[0];
         }
     }

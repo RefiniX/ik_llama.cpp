@@ -799,6 +799,33 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
     return ((const float *)(tensor->op_params))[i];
 }
 
+// The part of an element-wise op on nr rows of ne0 floats done by thread ith: rows [*r0, *r1), columns [*c0, *c1).
+// With nr >= nth this is the usual split by rows. With fewer rows than threads (token generation, MTP
+// verification) that split leaves most threads idle and thread 0 alone pulls in what the other threads just
+// wrote, so each row is also cut into blocks, as the sigmoid / silu / fused_mul_unary paths already do.
+// The blocks are multiples of 64 floats, so every element takes the same SIMD or scalar path as when the
+// whole row is done in one call and the results do not change.
+static inline void ggml_split_rows_cols(int64_t nr, int64_t ne0, int ith, int nth,
+        int64_t * r0, int64_t * r1, int64_t * c0, int64_t * c1) {
+    if (nr >= nth || nr == 0) {
+        const int64_t dr = (nr + nth - 1)/nth;
+        *r0 = dr*ith < nr ? dr*ith : nr;
+        *r1 = *r0 + dr < nr ? *r0 + dr : nr;
+        *c0 = 0; *c1 = ne0;
+        return;
+    }
+    const int64_t tpr = nth/nr; // threads per row
+    const int64_t row = ith/tpr;
+    if (row >= nr) {
+        *r0 = *r1 = 0; *c0 = *c1 = 0;
+        return;
+    }
+    const int64_t blk = ((ne0 + tpr - 1)/tpr + 63)/64*64;
+    *r0 = row; *r1 = row + 1;
+    *c0 = (ith % tpr)*blk < ne0 ? (ith % tpr)*blk : ne0;
+    *c1 = *c0 + blk < ne0 ? *c0 + blk : ne0;
+}
+
 #ifdef __cplusplus
 }
 #endif
