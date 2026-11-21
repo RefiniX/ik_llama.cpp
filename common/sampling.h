@@ -389,6 +389,10 @@ void common_sampler_accept(
 // access the internal list of current candidate tokens
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * ctx_sampling, bool do_sort = false);
 
+// top k (<= 128) of the logits in descending order, without building the full candidate array;
+// false when two of the k + 1 largest values are equal or a value is NaN (the order of partial_sort is then not unique)
+bool common_sampler_top_k_direct(const float * logits, int n_vocab, int k, llama_token_data * out);
+
 std::vector<llama_token> llama_sampling_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<llama_token> & draft);
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const std::vector<llama_token> & draft, bool grammar_first = false, positional_ban_set * positional_ban = nullptr);

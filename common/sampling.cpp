@@ -507,6 +507,127 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+// from i (a multiple of 8) on, the first block of 8 with a value that is not <= thr (NaN included), or the tail
+__attribute__((target("avx2")))
+static int common_sampler_top_k_skip_avx2(const float * logits, int i, int n_vocab, float thr) {
+    const __m256 t = _mm256_set1_ps(thr);
+    for (; i + 8 <= n_vocab; i += 8) {
+        if (_mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(logits + i), t, _CMP_NLE_UQ))) {
+            break;
+        }
+    }
+    return i;
+}
+#endif
+
+bool common_sampler_top_k_direct(const float * logits, int n_vocab, int k, llama_token_data * out) {
+    constexpr int k_max = 128;
+    if (k < 1 || k > k_max || k >= n_vocab) {
+        return false;
+    }
+    // the k + 1 largest values seen so far, in descending order
+    const int m = k + 1;
+    float val[k_max + 1];
+    int   ids[k_max + 1];
+    int   n = 0;
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    static const bool has_avx2 = __builtin_cpu_supports("avx2");
+#endif
+    for (int i = 0; i < n_vocab; ++i) {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+        if (has_avx2 && n == m && (i & 7) == 0) {
+            i = common_sampler_top_k_skip_avx2(logits, i, n_vocab, val[m - 1]);
+            if (i >= n_vocab) {
+                break;
+            }
+        }
+#endif
+        const float x = logits[i];
+        if (n == m && x <= val[m - 1]) {
+            continue;
+        }
+        if (x != x) {
+            return false; // NaN: partial_sort's order is not defined
+        }
+        int j = n < m ? n++ : m - 1;
+        for (; j > 0 && val[j - 1] < x; --j) {
+            val[j] = val[j - 1];
+            ids[j] = ids[j - 1];
+        }
+        val[j] = x;
+        ids[j] = i;
+    }
+    // partial_sort gives these k in this order only if the k + 1 largest values are all different
+    for (int j = 1; j < m; ++j) {
+        if (!(val[j - 1] > val[j])) {
+            return false;
+        }
+    }
+    for (int j = 0; j < k; ++j) {
+        out[j] = llama_token_data{ ids[j], val[j], 0.0f };
+    }
+    return true;
+}
+
+// When top_k is the first sampler that changes anything and nothing before it touches the full vocabulary
+// (no grammar, guidance, server biases, active penalties or DRY), take the top k straight from the logits instead
+// of copying the whole vocabulary into cur and partial-sorting it. The candidates top_k leaves are the same.
+static bool common_sampler_prepare_top_k_direct(
+        struct common_sampler * ctx_sampling, struct llama_context * ctx_main, struct llama_context * ctx_cfg, int idx) {
+    const common_params_sampling & params = ctx_sampling->params;
+    if (params.top_k <= 0 || ctx_cfg || ctx_sampling->grammar || ctx_sampling->adapt_p_ctx ||
+        params.temp <= 0.0f || params.mirostat != 0 || ctx_sampling->elb_states.size() > (size_t) ctx_sampling->elb_idx) {
+        return false;
+    }
+    if (ctx_sampling->rbudget && common_reasoning_budget_get_state(ctx_sampling->rbudget) == REASONING_BUDGET_FORCING) {
+        return false;
+    }
+    const int n_vocab = llama_n_vocab(llama_get_model(ctx_main));
+    if (ctx_sampling->server_biases && (int) ctx_sampling->server_biases->size() == n_vocab) {
+        return false;
+    }
+    const int32_t penalty_last_n = params.penalty_last_n < 0 ? params.n_prev : params.penalty_last_n;
+    const auto & penalty_tokens = params.use_penalty_prompt_tokens ? params.penalty_prompt_tokens : ctx_sampling->prev;
+    if (std::min((int) penalty_tokens.size(), penalty_last_n) > 0 &&
+        !(params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f)) {
+        return false;
+    }
+    bool top_k_first = false;
+    for (auto type : params.samplers_sequence) {
+        if (type == llama_sampler_type::TOP_K) {
+            top_k_first = true;
+            break;
+        }
+        const bool dry_off = params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0;
+        if (type != llama_sampler_type::DRY || !dry_off) {
+            break;
+        }
+    }
+    if (!top_k_first) {
+        return false;
+    }
+    const int k = std::max(params.top_k, std::max(1, params.min_keep)); // as llama_sample_top_k with sampler_queue's min_keep
+    // logit_bias goes into the logits in place, as in llama_sampling_prepare_impl (ignore_eos is a bias of -inf);
+    // when falling back to it, put the old values back first so that it applies the bias exactly once
+    float * logits = llama_get_logits_ith(ctx_main, idx);
+    std::vector<std::pair<llama_token, float>> saved;
+    for (const auto & [id, bias] : params.logit_bias) {
+        saved.emplace_back(id, logits[id]);
+        logits[id] += bias;
+    }
+    auto & cur = ctx_sampling->cur;
+    cur.resize(n_vocab);
+    if (!common_sampler_top_k_direct(logits, n_vocab, k, cur.data())) {
+        for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+            logits[it->first] = it->second;
+        }
+        return false;
+    }
+    ctx_sampling->cur_p = { cur.data(), (size_t) k, true };
+    return true;
+}
+
 static llama_token llama_sampling_sample_impl(
                   struct common_sampler * ctx_sampling,
                   struct llama_context * ctx_main,
@@ -522,7 +643,9 @@ static llama_token llama_sampling_sample_impl(
     const float   adaptive_target = params.adaptive_target;
 
     std::vector<float> original_logits;
-    llama_sampling_prepare(ctx_sampling, ctx_main, ctx_cfg, idx, /* grammar_first= */ grammar_first, &original_logits);
+    if (!common_sampler_prepare_top_k_direct(ctx_sampling, ctx_main, ctx_cfg, idx)) {
+        llama_sampling_prepare(ctx_sampling, ctx_main, ctx_cfg, idx, /* grammar_first= */ grammar_first, &original_logits);
+    }
     llama_token_data_array & cur_p = ctx_sampling->cur_p;
     if (ctx_sampling->grammar != NULL && !grammar_first) {
         GGML_ASSERT(!original_logits.empty());
