@@ -1027,6 +1027,32 @@ void quantize_row_q8_0_x4(const float * x, void * vy, int64_t k) {
 }
 
 namespace {
+#ifdef __AVX512F__
+// 32 values x * mul, rounded to nearest even, as int8 in order: the same values as the AVX2 code
+// (mul, round, cvtps_epi32, packs, permute). |q| <= 127, so the saturating packs change nothing.
+inline __m256i iqk_quantize_32_avx512(__m512 mul, const float * x) {
+    const __m512i perm = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    __m512i i0 = _mm512_cvt_roundps_epi32(_mm512_mul_ps(mul, _mm512_loadu_ps(x +  0)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m512i i1 = _mm512_cvt_roundps_epi32(_mm512_mul_ps(mul, _mm512_loadu_ps(x + 16)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m512i p = _mm512_packs_epi32(i0, i1);  // lane l: i0[4l..4l+3], i1[4l..4l+3] as int16
+    p = _mm512_packs_epi16(p, p);            // lane l, dword 0: i0[4l..4l+3], dword 1: i1[4l..4l+3] as int8
+    return _mm512_castsi512_si256(_mm512_permutexvar_epi32(perm, p));
+}
+// the four sums of 8 of 32 int8 (exact), with one vpsadbw instead of horizontal adds
+inline void iqk_sums8_avx512(__m256i q, int * s) {
+    alignas(32) uint64_t t[4];
+    _mm256_store_si256((__m256i *)t, _mm256_sad_epu8(_mm256_xor_si256(q, _mm256_set1_epi8(-128)), _mm256_setzero_si256()));
+    for (int j = 0; j < 4; ++j) s[j] = int(t[j]) - 8*128;
+}
+inline float iqk_max_abs_avx512(const float * x, int n) {
+    __m512 m = _mm512_setzero_ps();
+    for (int j = 0; j < n; j += 16) {
+        m = _mm512_max_ps(m, _mm512_andnot_ps(_mm512_set1_ps(-0.0f), _mm512_loadu_ps(x + j)));
+    }
+    return _mm512_reduce_max_ps(m);
+}
+#endif
+
 template <typename Block, typename Block_x4>
 void quantize_row_q8_1_x4_T(const float * x, Block * y, int64_t k) {
     assert(k % QK8_1 == 0);
@@ -1092,6 +1118,54 @@ void quantize_row_q8_1_x4_T(const float * x, Block * y, int64_t k) {
             } else {
                 y[i].s = GGML_FP32_TO_BF16(d * vaddvq_s32(accv)).bits;
             }
+        }
+    }
+#elif defined(__AVX512F__)
+    // the same values as the AVX2 code below (max and the integer sums are exact)
+    for (int i = 0; i < nb; i++) {
+        int i4 = i/4, ir = i%4;
+        const float max_scalar = iqk_max_abs_avx512(x, 32);
+        float d = max_scalar / 127.f;
+        if constexpr (std::is_same_v<Block, block_q8_1>) {
+            if (i < nb4) {
+                y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
+            } else {
+                y[i].d = GGML_FP32_TO_FP16(d);
+            }
+        } else {
+            auto t = GGML_FP32_TO_BF16(d);
+            d = ggml_bf16_to_fp32(t);
+            if (i < nb4) {
+                y4[i4].d[ir] = t.bits;
+            } else {
+                y[i].d = t.bits;
+            }
+        }
+        const float id = d > 0 ? 1/d : 0.f;
+        const __m256i q = iqk_quantize_32_avx512(_mm512_set1_ps(id), x);
+        x += 32;
+        int s[4];
+        iqk_sums8_avx512(q, s);
+        int isum = s[0] + s[1] + s[2] + s[3];
+        if constexpr (std::is_same_v<Block, block_q8_1>) {
+            if (i < nb4) {
+                y4[i4].d[ir+4] = GGML_FP32_TO_FP16(d * isum);
+            } else {
+                y[i].s = GGML_FP32_TO_FP16(d * isum);
+            }
+        } else {
+            if (i < nb4) {
+                auto i16 = (int16_t *)y4[i4].d;
+                i16[ir+4] = isum;
+            } else {
+                auto i16 = (int16_t *)&y[i].s;
+                i16[0] = isum;
+            }
+        }
+        if (i < nb4) {
+            _mm256_storeu_si256((__m256i *)y4[i4].qs + ir, q);
+        } else {
+            _mm256_storeu_si256((__m256i *)y[i].qs, q);
         }
     }
 #else
@@ -4377,8 +4451,30 @@ void iqk_quantize_row_q8_K_T(const float * x, void * vy, int64_t k) {
     //printf("Quantizing row with k = %ld, nb = %d, nbtail = %d\n", k, nb, nbtail);
     block_q8_K * y = (block_q8_K *)vy;
 #ifdef __AVX2__
+#ifdef __AVX512F__
+    // the same operations as the AVX2 version below, 16 values at a time (helpers before quantize_row_q8_1_x4_T):
+    // max and the integer sums are exact, so the results are the same
+    auto max_abs = [] (const float * x, int n) { return iqk_max_abs_avx512(x, n); };
+    auto make_mul = [] (float id) { return _mm512_set1_ps(id); };
+    auto quantize_block_32 = [] (__m512 mul, const float * x, int8_t * q8, int16_t & sum1, int16_t & sum2) {
+        const __m256i q = iqk_quantize_32_avx512(mul, x);
+        _mm256_storeu_si256((__m256i *)q8, q);
+        int s[4];
+        iqk_sums8_avx512(q, s);
+        sum1 = s[0] + s[1];
+        sum2 = s[2] + s[3];
+    };
+#else
     const __m256 signBit = _mm256_set1_ps(-0.0f);
     const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    auto max_abs = [&signBit] (const float * x, int n) {
+        __m256 maxAbs = _mm256_setzero_ps();
+        for (int j = 0; j < n; j += 8) {
+            maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps(signBit, _mm256_loadu_ps(x + j)));
+        }
+        return hmax_f32_8(maxAbs);
+    };
+    auto make_mul = [] (float id) { return _mm256_set1_ps(id); };
     auto quantize_block_32 = [&perm] (__m256 mul, const float * x, int8_t * q8, int16_t & sum1, int16_t & sum2) {
         __m256 v0 = _mm256_mul_ps(mul, _mm256_loadu_ps(x +  0));
         __m256 v1 = _mm256_mul_ps(mul, _mm256_loadu_ps(x +  8));
@@ -4400,19 +4496,14 @@ void iqk_quantize_row_q8_K_T(const float * x, void * vy, int64_t k) {
         i0 = _mm256_permutevar8x32_epi32(i0, perm);
         _mm256_storeu_si256((__m256i *)q8, i0);
     };
+#endif
     for (int i = 0; i < nb; i++) {
         const float * xb = x + i*QK_K;
-        __m256 maxAbs = _mm256_setzero_ps();
-        const float * xx = xb;
-        for (int ib = 0; ib < QK_K/8; ++ib) {
-            const __m256 v = _mm256_loadu_ps(xx); xx += 8;
-            maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps(signBit, v));
-        }
-        const float maxScalar = hmax_f32_8(maxAbs);
+        const float maxScalar = max_abs(xb, QK_K);
         const float d = maxScalar / 127.f;
         y[i].d = d;
         const float id = (maxScalar != 0.0f) ? 127.f / maxScalar : 0.0f;
-        const __m256 mul = _mm256_set1_ps(id);
+        const auto mul = make_mul(id);
         int8_t * q8 = y[i].qs;
         int block_sum_i32 = 0;
         for (int ib = 0; ib < QK_K/32; ++ib) {
@@ -4439,17 +4530,11 @@ void iqk_quantize_row_q8_K_T(const float * x, void * vy, int64_t k) {
     }
     if (nbtail > 0) {
         const float * xb = x + nb*QK_K;
-        __m256 maxAbs = _mm256_setzero_ps();
-        const float * xx = xb;
-        for (int ib = 0; ib < 4*nbtail; ++ib) {
-            const __m256 v = _mm256_loadu_ps(xx); xx += 8;
-            maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps(signBit, v));
-        }
-        const float maxScalar = hmax_f32_8(maxAbs);
+        const float maxScalar = max_abs(xb, 32*nbtail);
         const float d = maxScalar / 127.f;
         y[nb].d = d;
         const float id = (maxScalar != 0.0f) ? 127.f / maxScalar : 0.0f;
-        const __m256 mul = _mm256_set1_ps(id);
+        const auto mul = make_mul(id);
         int8_t * q8 = y[nb].qs;
         auto bsums = (int16_t *)(y[nb].qs + 32*nbtail);
         int block_sum_i32 = 0;
